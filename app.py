@@ -2898,7 +2898,7 @@ with page_tabs[7]:
             "Qty",
             min_value=1,
             max_value=1000000,
-            value=calc_qty
+            value=calc_qty,
             key=f"etf_qty_{sym}"
         )
         if c4.button("Trade", key=f"etf_trade_{sym}") and lp > 0:
