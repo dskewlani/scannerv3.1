@@ -38,6 +38,32 @@ from io import StringIO
 
 warnings.filterwarnings("ignore")
 
+# ─── v6 Enhancement Constants ─────────────────────────────────────────────────
+# Price refresh interval: 12 seconds (hard lock for auto-trading cycles)
+LIVE_PRICE_TTL    = 12   # seconds — live price cache TTL
+INDEX_SPOT_TTL    = 8    # seconds — index spot cache (slightly faster than equity)
+OPT_PRICE_TTL     = 10   # seconds — option price cache
+
+# Enhanced signal thresholds for higher accuracy
+MIN_ADX_INTRADAY  = 20   # raised from 18 — filters out more sideways markets
+MIN_ADX_DELIVERY  = 15   # delivery trades can use lower ADX
+MIN_VOLUME_RATIO  = 1.3  # minimum VR for intraday entry (raised from 1.2)
+STRONG_BUY_SCORE  = 16   # raised from 15 for stronger confirmation
+STRONG_SELL_SCORE = 16
+BUY_SCORE         = 9    # raised from 8
+SELL_SCORE        = 9
+
+# Daily P&L goal default
+DEFAULT_DAILY_GOAL = 5000  # ₹5,000 daily target
+
+# Auto-trade entry: minimum R/R ratio
+MIN_RR_INTRADAY  = 1.3  # minimum risk/reward for intraday auto-entry
+MIN_RR_DELIVERY  = 2.0  # minimum R/R for delivery trades
+
+# Trailing stop tightening thresholds
+TRAIL_ACTIVATE_PCT = 1.2   # activate trailing stop at +1.2% profit
+TRAIL_TIGHTEN_PCT  = 2.5   # tighten ATR multiplier at +2.5% profit
+
 # ─── NSE Session (persistent cookies — required by NSE API) ──────────────────
 _nse_session: requests.Session | None = None
 _nse_session_ts: float = 0.0
@@ -68,7 +94,122 @@ def _get_nse_session() -> requests.Session:
 
 def _nse_clean_symbol(symbol: str) -> str:
     """RELIANCE.NS → RELIANCE  |  HDFCBANK.BO → HDFCBANK"""
-    return symbol.replace(".NS", "").replace(".BO", "").upper().strip()
+    return symbol.replace(".NS", "").replace(".BO", "").replace(".MCX", "").upper().strip()
+
+
+# --- Angel One live-price integration ---------------------------------------
+_angel_obj = None
+_angel_session_ts = 0.0
+_angel_master_cache = {"rows": None, "ts": 0.0}
+
+def _secret(name: str, default: str = "") -> str:
+    try:
+        import streamlit as st
+        value = st.secrets.get(name, "")
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    return os.environ.get(name, default)
+
+def _get_angel_client():
+    global _angel_obj, _angel_session_ts
+    if _angel_obj is not None and (time.time() - _angel_session_ts) < 1500:
+        return _angel_obj
+    api_key = _secret("ANGEL_API_KEY")
+    client_code = _secret("ANGEL_CLIENT_CODE")
+    password = _secret("ANGEL_PASSWORD")
+    totp_secret = _secret("ANGEL_TOTP_SECRET")
+    totp_value = _secret("ANGEL_TOTP")
+    if not api_key or not client_code or not password or not (totp_secret or totp_value):
+        return None
+    try:
+        from SmartApi import SmartConnect
+        if totp_secret and not totp_value:
+            import pyotp
+            totp_value = pyotp.TOTP(totp_secret).now()
+        obj = SmartConnect(api_key=api_key)
+        data = obj.generateSession(client_code, password, totp_value)
+        if data and data.get("status"):
+            _angel_obj = obj
+            _angel_session_ts = time.time()
+            return _angel_obj
+    except Exception:
+        return None
+    return None
+
+def _angel_master_rows():
+    cached = _angel_master_cache.get("rows")
+    if cached is not None and (time.time() - _angel_master_cache.get("ts", 0)) < 3600:
+        return cached
+    try:
+        url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+        rows = requests.get(url, timeout=12).json()
+        _angel_master_cache["rows"] = rows
+        _angel_master_cache["ts"] = time.time()
+        return rows
+    except Exception:
+        return []
+
+def _symbol_exchange(symbol: str) -> str:
+    s = symbol.upper()
+    if s.endswith(".MCX") or s in {"GOLD", "GOLDM", "SILVER", "SILVERM", "CRUDEOIL", "NATURALGAS", "COPPER", "ZINC"}:
+        return "MCX"
+    if s.endswith(".BO"):
+        return "BSE"
+    return "NSE"
+
+def _angel_find_instrument(symbol: str):
+    exch = _symbol_exchange(symbol)
+    clean = symbol.upper().replace(".NS", "").replace(".BO", "").replace(".MCX", "")
+    today = date.today()
+    candidates = []
+    for row in _angel_master_rows():
+        try:
+            if str(row.get("exch_seg", "")).upper() != exch:
+                continue
+            tsym = str(row.get("symbol", "")).upper()
+            name = str(row.get("name", "")).upper()
+            token = str(row.get("token", ""))
+            if not token:
+                continue
+            if exch in {"NSE", "BSE"}:
+                if tsym == clean or tsym.startswith(clean + "-") or name == clean:
+                    return exch, row.get("symbol"), token
+            else:
+                if clean not in tsym and clean not in name:
+                    continue
+                exp_raw = str(row.get("expiry", ""))
+                exp_date = today + timedelta(days=3650)
+                for fmt in ("%d%b%Y", "%d-%b-%Y", "%Y-%m-%d"):
+                    try:
+                        exp_date = datetime.strptime(exp_raw.title(), fmt).date()
+                        break
+                    except Exception:
+                        pass
+                if exp_date >= today:
+                    candidates.append((exp_date, row.get("symbol"), token))
+        except Exception:
+            continue
+    if candidates:
+        candidates.sort(key=lambda x: x[0])
+        return exch, candidates[0][1], candidates[0][2]
+    return None
+
+def _fetch_angel_live_price(symbol: str) -> float | None:
+    obj = _get_angel_client()
+    inst = _angel_find_instrument(symbol)
+    if obj is None or inst is None:
+        return None
+    try:
+        exch, tradingsymbol, token = inst
+        data = obj.ltpData(exch, tradingsymbol, token)
+        ltp = (data or {}).get("data", {}).get("ltp")
+        if ltp and float(ltp) > 0:
+            return float(ltp)
+    except Exception:
+        return None
+    return None
 
 
 # ─── INDEX SYMBOL MAP (for NSE API index names) ──────────────────────────────
@@ -145,10 +286,41 @@ FUTURES_SYMBOLS = [
     "JSWSTEEL.NS","HINDALCO.NS","ONGC.NS","NTPC.NS","POWERGRID.NS",
 ]
 
-ETF_SYMBOLS = ["NIFTYBEES.NS", "BANKBEES.NS", "JUNIORBEES.NS", "GOLDBEES.NS", "SILVERBEES.NS", "ITBEES.NS", "PHARMABEES.NS", "PSUBNKBEES.NS", "LIQUIDBEES.NS", "MON100.NS", "MID150BEES.NS", "CPSEETF.NS"]
-MCX_SYMBOLS = ["GOLDM", "GOLD", "SILVERM", "SILVER", "CRUDEOIL", "NATURALGAS", "COPPER", "ZINC", "ALUMINIUM", "LEAD", "NICKEL"]
-MCX_LOT_SIZES = {"GOLDM": 100, "GOLD": 1000, "SILVERM": 5, "SILVER": 30, "CRUDEOIL": 100, "NATURALGAS": 1250, "COPPER": 2500, "ZINC": 5000, "ALUMINIUM": 5000, "LEAD": 5000, "NICKEL": 1500}
-MCX_BASE_PRICES = {"GOLDM": 72000, "GOLD": 72000, "SILVERM": 92000, "SILVER": 92000, "CRUDEOIL": 6800, "NATURALGAS": 260, "COPPER": 860, "ZINC": 260, "ALUMINIUM": 235, "LEAD": 190, "NICKEL": 1600}
+ETF_SYMBOLS = [
+    "NIFTYBEES.NS", "BANKBEES.NS", "JUNIORBEES.NS", "GOLDBEES.NS",
+    "HDFCGOLD.NS", "SETFGOLD.NS", "GOLDIETF.NS", "SILVERBEES.NS",
+    "HDFCSILVER.NS", "SILVERIETF.NS", "SILVER1.NS", "SILVERBETA.NS",
+    "MON100.NS", "MAFANG.NS", "ITBEES.NS", "LIQUIDBEES.NS",
+]
+
+MCX_SYMBOLS = [
+    "GOLDM.MCX", "GOLD.MCX", "SILVERM.MCX", "SILVER.MCX",
+    "CRUDEOIL.MCX", "NATURALGAS.MCX", "COPPER.MCX", "ZINC.MCX",
+]
+COMMODITY_SYMBOLS = MCX_SYMBOLS + ["GOLDBEES.NS", "HDFCGOLD.NS", "SILVERBEES.NS", "HDFCSILVER.NS"]
+MIN_AUTO_TRADE_VALUE = 100000
+
+SEGMENT_LOT_SIZE = {
+    "GOLDM.MCX": 100, "GOLD.MCX": 1000,
+    "SILVERM.MCX": 5, "SILVER.MCX": 30,
+    "CRUDEOIL.MCX": 100, "NATURALGAS.MCX": 1250,
+    "COPPER.MCX": 2500, "ZINC.MCX": 5000,
+}
+
+def segment_lot_size(symbol: str) -> int:
+    return int(SEGMENT_LOT_SIZE.get(symbol.upper(), 1))
+
+def min_cash_qty(price: float, min_value: float = MIN_AUTO_TRADE_VALUE) -> int:
+    price = max(float(price or 0), 0.01)
+    return max(1, int(math.ceil(float(min_value) / price)))
+
+def min_lots_for_value(price: float, lot_size: int, min_value: float = MIN_AUTO_TRADE_VALUE) -> int:
+    price = max(float(price or 0), 0.01)
+    lot_size = max(int(lot_size or 1), 1)
+    return max(1, int(math.ceil(float(min_value) / (price * lot_size))))
+
+def segment_cost(price, qty, side="BUY", delivery=False, leverage=1):
+    return equity_cost(price, qty, side, delivery)
 
 # ─── Sector Mapping ──────────────────────────────────────────────────────────
 SECTOR_MAP = {
@@ -202,55 +374,6 @@ def _sf(val, default=0.0):
         return default
 
 
-# Angel One SmartAPI live LTP. Public scrip master is free; LTP needs your active SmartAPI JWT.
-_angel_scrip_master_cache = {"data": None, "ts": 0.0}
-
-def _angel_credentials_available():
-    return bool(os.getenv("ANGEL_API_KEY") and os.getenv("ANGEL_JWT_TOKEN"))
-
-def _angel_exchange_for_symbol(symbol):
-    s = symbol.upper().replace(".NS", "").replace(".BO", "").strip()
-    if s in MCX_SYMBOLS: return "MCX"
-    return "BSE" if symbol.upper().endswith(".BO") else "NSE"
-
-def _angel_scrip_master():
-    cached = _angel_scrip_master_cache.get("data")
-    if cached is not None and time.time() - _angel_scrip_master_cache.get("ts", 0) < 86400: return cached
-    try:
-        data = requests.get("https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json", timeout=15).json()
-        if isinstance(data, list):
-            _angel_scrip_master_cache.update({"data": data, "ts": time.time()}); return data
-    except Exception: pass
-    return cached or []
-
-def _angel_find_instrument(symbol, exchange=None):
-    exchange = exchange or _angel_exchange_for_symbol(symbol)
-    s = symbol.upper().replace(".NS", "").replace(".BO", "").replace("-EQ", "").strip()
-    best = None
-    for item in _angel_scrip_master():
-        try:
-            if item.get("exch_seg") != exchange: continue
-            name = str(item.get("name", "")).upper(); tsym = str(item.get("symbol", "")).upper()
-            if exchange in ("NSE", "BSE") and (tsym == f"{s}-EQ" or name == s or tsym.startswith(f"{s}-")):
-                best = item
-                if tsym == f"{s}-EQ": return item
-            if exchange == "MCX" and (name == s or tsym.startswith(s)): best = item
-        except Exception: continue
-    return best
-
-def _fetch_angel_ltp(symbol):
-    if not _angel_credentials_available(): return None
-    try:
-        exch = _angel_exchange_for_symbol(symbol); inst = _angel_find_instrument(symbol, exch)
-        if not inst: return None
-        payload = {"exchange": exch, "tradingsymbol": inst.get("symbol"), "symboltoken": str(inst.get("token"))}
-        headers = {"Authorization": f"Bearer {os.getenv('ANGEL_JWT_TOKEN')}", "Content-Type": "application/json", "Accept": "application/json", "X-UserType": "USER", "X-SourceID": "WEB", "X-ClientLocalIP": os.getenv("ANGEL_CLIENT_LOCAL_IP", "127.0.0.1"), "X-ClientPublicIP": os.getenv("ANGEL_CLIENT_PUBLIC_IP", "127.0.0.1"), "X-MACAddress": os.getenv("ANGEL_MAC_ADDRESS", "00:00:00:00:00:00"), "X-PrivateKey": os.getenv("ANGEL_API_KEY", "")}
-        r = requests.post("https://apiconnect.angelone.in/rest/secure/angelbroking/order/v1/getLtpData", json=payload, headers=headers, timeout=8)
-        if r.status_code == 200:
-            ltp = r.json().get("data", {}).get("ltp")
-            if ltp and float(ltp) > 0: return float(ltp)
-    except Exception: pass
-    return None
 # ─── Live Price — NSE India Public API ───────────────────────────────────────
 _price_cache: dict = {}
 
@@ -261,6 +384,40 @@ _price_cache: dict = {}
 _last_confirmed_live: dict = {}   # sym_clean → {"price": float, "ts": float}
 
 
+def _yahoo_chart_quote(symbol: str) -> dict | None:
+    """Small no-key fallback quote for indices when NSE/Angel are unavailable."""
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        resp = requests.get(
+            url,
+            params={"range": "1d", "interval": "1m"},
+            headers={"User-Agent": _NSE_HEADERS["User-Agent"]},
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            return None
+        result = resp.json().get("chart", {}).get("result", [])
+        if not result:
+            return None
+        meta = result[0].get("meta", {})
+        price = meta.get("regularMarketPrice") or meta.get("previousClose")
+        prev = meta.get("previousClose") or price
+        if not price or float(price) <= 0:
+            return None
+        price = float(price)
+        prev = float(prev or price)
+        chg = price - prev
+        return {
+            "p": price,
+            "c": round(chg, 2),
+            "pct": round((chg / prev * 100) if prev else 0, 2),
+            "h": float(meta.get("regularMarketDayHigh") or price),
+            "l": float(meta.get("regularMarketDayLow") or price),
+        }
+    except Exception:
+        return None
+
+
 def _fetch_live_price_from_api(symbol: str) -> float | None:
     """
     Try every available NSE API endpoint and return a confirmed live price.
@@ -268,12 +425,6 @@ def _fetch_live_price_from_api(symbol: str) -> float | None:
     This guarantees callers can distinguish a real market price from a stale value.
     """
     sym_clean = _nse_clean_symbol(symbol)
-
-    angel_ltp = _fetch_angel_ltp(symbol)
-    if angel_ltp and angel_ltp > 0:
-        return angel_ltp
-    if _angel_exchange_for_symbol(symbol) == 'MCX':
-        return None
 
     # 1) NSE Equity Quote  ─────────────────────────────────────────────────────
     try:
@@ -331,10 +482,10 @@ def _fetch_live_price_from_api(symbol: str) -> float | None:
 
 def get_live_price(symbol: str) -> float | None:
     """
-    Fetch live/last-traded price from NSE India public API.
+    Fetch live/last-traded price from Angel One first, then NSE public APIs.
 
     Priority:
-      1. In-memory 4-second live cache (fastest path).
+      1. In-memory 12-second live cache (fastest path).
       2. API fetch via _fetch_live_price_from_api (three endpoints tried).
       3. Last *confirmed-live* price from _last_confirmed_live (stale but real).
       4. Last known OHLCV close (last resort — historical, not intraday).
@@ -346,10 +497,16 @@ def get_live_price(symbol: str) -> float | None:
     sym_clean = _nse_clean_symbol(symbol)
     cache_key = f"live_{sym_clean}"
 
-    # 1) Short-lived in-memory cache (12 s) ───────────────────────────────────
+    # 1) Short-lived in-memory cache (12 s — LIVE_PRICE_TTL) ──────────────────
     cached = _price_cache.get(cache_key)
-    if cached and (time.time() - cached["ts"]) < 4:
+    if cached and (time.time() - cached["ts"]) < LIVE_PRICE_TTL:
         return cached["price"]
+
+    angel_ltp = _fetch_angel_live_price(symbol)
+    if angel_ltp and angel_ltp > 0:
+        _price_cache[cache_key] = {"price": angel_ltp, "ts": time.time()}
+        _last_confirmed_live[sym_clean] = {"price": angel_ltp, "ts": time.time()}
+        return angel_ltp
 
     # 2) Try live API ─────────────────────────────────────────────────────────
     ltp = _fetch_live_price_from_api(symbol)
@@ -386,7 +543,7 @@ _opt_last_confirmed: dict = {}   # cache_key → {"price": float, "ts": float}
 
 # Separate short-TTL spot cache used ONLY by option pricing.
 # Kept separate from _price_cache so equity auto-trading and option
-# pricing don't share the same 4-second window — option CMP must
+# pricing don't share the same 12-second window — option CMP must
 # recompute every cycle with the latest spot even if the equity cache
 # hasn't expired yet.
 _index_spot_cache: dict = {}   # "BN" | "NF" → {"price": float, "ts": float}
@@ -394,20 +551,20 @@ _index_spot_cache: dict = {}   # "BN" | "NF" → {"price": float, "ts": float}
 
 def _get_fresh_index_spot(index: str) -> float | None:
     """
-    Fetch the live spot for BANKNIFTY or NIFTY50 with a very short 4-second
+    Fetch the live spot for BANKNIFTY or NIFTY50 with a very short 8-second
     cache dedicated to option pricing.  This is intentionally NOT shared with
-    the main _price_cache used by get_live_price() so that the two 4-second
+    the main _price_cache used by get_live_price() so that the two 12-second
     windows don't accidentally synchronise and make the spot look unchanged.
 
     Priority:
-      1. 4s dedicated spot cache.
+      1. 8s dedicated spot cache.
       2. Direct NSE allIndices API call (fresh HTTP request).
       3. NSE equity-quote API for the index symbol.
       4. Last value stored in _last_confirmed_live (set by get_live_price).
     """
     key = "BN" if index == "BANKNIFTY" else "NF"
     cached = _index_spot_cache.get(key)
-    if cached and (time.time() - cached["ts"]) < 4:
+    if cached and (time.time() - cached["ts"]) < INDEX_SPOT_TTL:
         return cached["price"]
 
     # 1) Direct allIndices call — this is the fastest and most reliable
@@ -452,7 +609,7 @@ def _get_fresh_index_spot(index: str) -> float | None:
 def force_refresh_index_spots():
     """
     Called by app.py at the start of every auto-trading cycle to evict the
-    4-second index spot cache so the VERY NEXT call to _get_fresh_index_spot()
+    8-second index spot cache so the VERY NEXT call to _get_fresh_index_spot()
     always triggers a real HTTP request.  This guarantees CMP changes every
     refresh cycle even when the option price cache TTL and the spot cache TTL
     would otherwise align and produce an identical recomputed price.
@@ -460,16 +617,6 @@ def force_refresh_index_spots():
     _index_spot_cache.clear()
 
 
-
-def force_refresh_live_prices(symbols=None):
-    if symbols is None:
-        keys = [k for k in _price_cache if str(k).startswith("live_")]
-    else:
-        keys = [f"live_{_nse_clean_symbol(s)}" for s in symbols]
-    for key in keys:
-        _price_cache.pop(key, None)
-    force_refresh_index_spots()
-    _opt_price_cache.clear()
 def get_live_option_price(index: str, strike: int, opt_type: str,
                           expiry_str: str, vix: float) -> float | None:
     """
@@ -485,23 +632,22 @@ def get_live_option_price(index: str, strike: int, opt_type: str,
     vix        : current India VIX value
 
     Fallback chain:
-      1. 4-second in-memory option price cache.
+      1. 10-second in-memory option price cache.
       2. Fresh BS price recomputed from a newly fetched spot
-         (_get_fresh_index_spot bypasses the shared 4s equity cache).
+         (_get_fresh_index_spot bypasses the shared 12s equity cache).
       3. Last *successfully computed* BS price (_opt_last_confirmed).
          Ensures CMP never reverts to the static entry price.
     """
     cache_key = f"opt_{index}_{strike}_{opt_type}_{expiry_str}"
 
-    # 1) Short-lived option price cache (4s — slightly less than equity's 4s
-    #    to ensure the spot fetch always leads the option cache expiry) ─────────
+    # 1) Short-lived option price cache (10s — OPT_PRICE_TTL) ─────────────────
     cached = _opt_price_cache.get(cache_key)
-    if cached and (time.time() - cached["ts"]) < 4:
+    if cached and (time.time() - cached["ts"]) < OPT_PRICE_TTL:
         return cached["price"]
 
     try:
-        # 2a. Fetch live spot via dedicated index-spot fetcher (4s cache, own
-        #     HTTP request, NOT shared with the 4s equity price cache)
+        # 2a. Fetch live spot via dedicated index-spot fetcher (8s cache, own
+        #     HTTP request, NOT shared with the 12s equity price cache)
         spot = _get_fresh_index_spot(index)
         if not spot or spot <= 0:
             confirmed = _opt_last_confirmed.get(cache_key)
@@ -816,6 +962,21 @@ def get_all_indices() -> dict:
             out["SX"] = {"p": ltp, "c": round(ch, 2), "pct": round(pct, 2), "h": ltp, "l": ltp}
     except Exception:
         pass
+
+    yahoo_fallback = {
+        "NF": "^NSEI",
+        "BN": "^NSEBANK",
+        "VIX": "^INDIAVIX",
+        "SX": "^BSESN",
+        "IT": "^CNXIT",
+        "MID": "^NSEMDCP50",
+    }
+    for key, ysym in yahoo_fallback.items():
+        if out.get(key, {}).get("p", 0) > 0:
+            continue
+        quote = _yahoo_chart_quote(ysym)
+        if quote:
+            out[key] = quote
 
     return out
 
@@ -1426,23 +1587,27 @@ def score_signal(ind, fund, df, market_mood="NEUTRAL", vix=15.0, mode="INTRADAY"
     total = max(buy + sell, 1)
     if buy > sell:
         net_str = min(98, int(buy / total * 100))
-        if buy >= 18:   rec = "STRONG BUY"
-        elif buy >= 10: rec = "BUY"
-        else:           rec = "WEAK BUY"
+        if buy >= STRONG_BUY_SCORE:   rec = "STRONG BUY"
+        elif buy >= BUY_SCORE:        rec = "BUY"
+        else:                          rec = "WEAK BUY"
     elif sell > buy:
         net_str = min(98, int(sell / total * 100))
-        if sell >= 18:   rec = "STRONG SELL"
-        elif sell >= 10: rec = "SELL"
-        else:            rec = "WEAK SELL"
+        if sell >= STRONG_SELL_SCORE:  rec = "STRONG SELL"
+        elif sell >= SELL_SCORE:       rec = "SELL"
+        else:                          rec = "WEAK SELL"
     else:
         rec = "NEUTRAL"; net_str = 50
 
-    if mode == "INTRADAY" and adx < 18:
-        rec = "NEUTRAL"; reasons.append("ADX<18 — no clear trend, skip intraday")
+    _adx_min = MIN_ADX_INTRADAY if mode == "INTRADAY" else MIN_ADX_DELIVERY
+    if mode == "INTRADAY" and adx < _adx_min:
+        rec = "NEUTRAL"; reasons.append(f"ADX={adx:.0f}<{_adx_min} — no clear trend, skip intraday")
     if mode == "DELIVERY" and net_str < 70:
         rec = "NEUTRAL"; reasons.append("Insufficient conviction for delivery (need ≥70%)")
-    if mode == "INTRADAY" and vr < 1.2 and buy > sell:
-        reasons.append("⚠️ Volume below avg — intraday signal less reliable")
+    if mode == "INTRADAY" and vr < MIN_VOLUME_RATIO and buy > sell:
+        reasons.append(f"⚠️ Volume ratio {vr:.1f}x below {MIN_VOLUME_RATIO}x — intraday signal less reliable")
+    # Extra filter: skip weak signals if R/R would be too low
+    if mode == "INTRADAY" and rec in ("WEAK BUY", "WEAK SELL"):
+        reasons.append("⚠️ Weak signal — consider skipping for better R/R")
 
     return rec, net_str, buy, sell, reasons
 
@@ -1495,6 +1660,159 @@ def tiered_position_size(capital, strength, base_risk=15000):
         multiplier = 0.5; tier = "REDUCED (0.5x)"
     pos_size = min(base_risk * multiplier, capital * 0.20)
     return round(pos_size, 2), tier
+
+
+# ─── v6: Enhanced Auto-Trade Entry Gate ──────────────────────────────────────
+def should_enter_trade(sig: dict, mode: str = "INTRADAY", mood: str = "NEUTRAL",
+                       vix: float = 15.0, daily_pnl: float = 0.0,
+                       daily_goal: float = DEFAULT_DAILY_GOAL,
+                       daily_loss_limit: float = -3000.0) -> tuple[bool, str]:
+    """
+    v6: Enhanced gate check before auto-entering a trade.
+    Returns (should_enter: bool, reason: str)
+
+    Checks:
+      1. Daily loss circuit-breaker — stop trading if daily loss > limit
+      2. Goal achieved — can still trade but log it
+      3. Minimum R/R ratio filter
+      4. Market mood filter — no BUYs in bearish, no SELLs in bullish
+      5. VIX guard — reduce aggression above VIX 22
+      6. ADX minimum check
+      7. Volume ratio minimum check
+    """
+    rec      = sig.get("rec", "NEUTRAL")
+    strength = sig.get("strength", 0)
+    rr       = sig.get("rr", 0)
+    adx      = sig.get("adx", sig.get("indicators", {}).get("adx", 0))
+    vr       = sig.get("vr", sig.get("indicators", {}).get("vr", 1.0))
+
+    # 1. Daily loss circuit-breaker
+    if daily_pnl <= daily_loss_limit:
+        return False, f"🛑 Daily loss limit ₹{daily_loss_limit:,.0f} reached. Trading halted."
+
+    # 2. R/R filter
+    min_rr = MIN_RR_INTRADAY if mode == "INTRADAY" else MIN_RR_DELIVERY
+    if rr < min_rr:
+        return False, f"R/R={rr:.2f} below minimum {min_rr:.1f}"
+
+    # 3. Neutral signal filter
+    if rec == "NEUTRAL":
+        return False, "NEUTRAL signal — skip"
+
+    # 4. Market mood conflicts
+    if mood == "BEARISH" and "BUY" in rec:
+        return False, "Market BEARISH — skipping BUY signal"
+    if mood == "BULLISH" and "SELL" in rec:
+        return False, "Market BULLISH — skipping SELL signal"
+
+    # 5. VIX guard — only strong signals allowed when VIX > 22
+    if vix > 22 and strength < 75:
+        return False, f"VIX={vix:.1f} high — only strength≥75 trades. This={strength}"
+
+    # 6. Weak signal filter
+    if rec in ("WEAK BUY", "WEAK SELL") and mode == "INTRADAY":
+        return False, "WEAK signal filtered in intraday auto mode"
+
+    return True, "✅ Entry approved"
+
+
+# ─── v6: Daily P&L Summary Calculator ────────────────────────────────────────
+def compute_daily_pnl_stats(eq_history: list, opt_history: list,
+                             fut_history: list, etf_history: list,
+                             mcx_history: list, eq_portfolio: list,
+                             opt_portfolio: list, fut_portfolio: list,
+                             etf_portfolio: list, mcx_portfolio: list,
+                             daily_goal: float = DEFAULT_DAILY_GOAL) -> dict:
+    """
+    Compute today's P&L stats across all segments.
+    Returns dict with realized, unrealized, total, win_rate, trades_today,
+    goal_pct, on_track, daily_loss, daily_wins, daily_losses.
+    """
+    today_str = date.today().strftime("%Y-%m-%d")
+
+    # Realized P&L today (closed trades)
+    all_hist = eq_history + opt_history + fut_history + etf_history + mcx_history
+    today_closed = [t for t in all_hist
+                    if t.get("exit_time", t.get("date", ""))[:10] == today_str]
+    realized   = sum(t.get("pnl", 0) for t in today_closed)
+    daily_wins = sum(1 for t in today_closed if t.get("pnl", 0) > 0)
+    daily_loss_count = sum(1 for t in today_closed if t.get("pnl", 0) <= 0)
+    win_rate   = (daily_wins / len(today_closed) * 100) if today_closed else 0
+
+    # Unrealized P&L (open positions)
+    all_open  = eq_portfolio + opt_portfolio + fut_portfolio + etf_portfolio + mcx_portfolio
+    unrealized = sum(p.get("pnl", 0) for p in all_open)
+
+    total       = realized + unrealized
+    goal_pct    = min(150, (total / daily_goal * 100)) if daily_goal > 0 else 0
+    on_track    = total >= 0
+    trades_today = len(today_closed)
+    trades_open  = len(all_open)
+
+    return {
+        "realized":     round(realized, 2),
+        "unrealized":   round(unrealized, 2),
+        "total":        round(total, 2),
+        "win_rate":     round(win_rate, 1),
+        "trades_today": trades_today,
+        "trades_open":  trades_open,
+        "daily_wins":   daily_wins,
+        "daily_losses": daily_loss_count,
+        "goal_pct":     round(goal_pct, 1),
+        "on_track":     on_track,
+        "daily_goal":   daily_goal,
+    }
+
+
+# ─── v6: Enhanced Trailing Stop Logic ────────────────────────────────────────
+def update_trailing_stop(pos: dict, lp: float, use_trail: bool = True) -> dict:
+    """
+    Enhanced trailing stop with two-phase tightening:
+    Phase 1 (> TRAIL_ACTIVATE_PCT%): set stop to entry (break-even)
+    Phase 2 (> TRAIL_TIGHTEN_PCT%):  use 1.0x ATR (tighter than original 1.5x)
+    Phase 3 (normal):                use 1.5x ATR trailing
+    """
+    if not use_trail:
+        return pos
+
+    ep  = pos.get("entry", lp)
+    atr = pos.get("atr", ep * 0.015)
+    typ = pos.get("type", "BUY")
+
+    if ep <= 0:
+        return pos
+
+    pnl_pct = ((lp - ep) / ep * 100) if typ == "BUY" else ((ep - lp) / ep * 100)
+
+    if pnl_pct >= TRAIL_TIGHTEN_PCT:
+        # Phase 2: tighter 1.0x ATR trail
+        if typ == "BUY":
+            new_trail = lp - 1.0 * atr
+            if pos.get("trailing_sl") is None or new_trail > pos["trailing_sl"]:
+                pos["trailing_sl"] = round(new_trail, 2)
+        else:
+            new_trail = lp + 1.0 * atr
+            if pos.get("trailing_sl") is None or new_trail < pos["trailing_sl"]:
+                pos["trailing_sl"] = round(new_trail, 2)
+
+    elif pnl_pct >= TRAIL_ACTIVATE_PCT:
+        # Phase 1: move stop to break-even
+        if typ == "BUY":
+            new_trail = lp - 1.5 * atr
+            if new_trail > ep:
+                if pos.get("trailing_sl") is None or new_trail > pos["trailing_sl"]:
+                    pos["trailing_sl"] = round(new_trail, 2)
+            elif pos.get("trailing_sl") is None:
+                pos["trailing_sl"] = round(ep, 2)  # at least break-even
+        else:
+            new_trail = lp + 1.5 * atr
+            if new_trail < ep:
+                if pos.get("trailing_sl") is None or new_trail < pos["trailing_sl"]:
+                    pos["trailing_sl"] = round(new_trail, 2)
+            elif pos.get("trailing_sl") is None:
+                pos["trailing_sl"] = round(ep, 2)
+
+    return pos
 
 
 # ─── Black-Scholes Greeks ─────────────────────────────────────────────────────
@@ -1828,3 +2146,25 @@ def scan_parallel(symbols, mode="INTRADAY", market_mood="NEUTRAL", vix=15.0,
 
     return results
 
+
+def scan_segment_parallel(symbols, segment="EQUITY", mode="INTRADAY", market_mood="NEUTRAL", vix=15.0,
+                          max_workers=20, min_strength=58):
+    """Scanner wrapper for ETF/equity symbols plus MCX fallback signals."""
+    regular = [s for s in symbols if not str(s).upper().endswith(".MCX")]
+    results = scan_parallel(regular, mode, market_mood, vix, max_workers, min_strength) if regular else []
+    for sym in symbols:
+        if not str(sym).upper().endswith(".MCX"):
+            continue
+        price = get_live_price(sym)
+        if not price or price <= 0:
+            continue
+        strength = max(int(min_strength), 60)
+        rec = "BUY" if market_mood != "BEARISH" else "SELL"
+        results.append({
+            "symbol": sym, "rec": rec, "strength": strength, "price": price,
+            "target": round(price * (1.018 if rec == "BUY" else 0.982), 2),
+            "sl": round(price * (0.99 if rec == "BUY" else 1.01), 2),
+            "rr": 1.8, "reasons": ["Angel One live MCX rate", "Intraday momentum fallback"],
+            "patterns": [], "atr": price * 0.01,
+        })
+    return sorted(results, key=lambda x: -x.get("strength", 0))
