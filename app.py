@@ -1,5 +1,3 @@
-
-
 """
 app.py — ProTrader Terminal v3
 Professional Trading Terminal: Equity · Options · Futures · Auto Trading
@@ -98,6 +96,15 @@ def get_expiries(n=5):
         if len(dates) == n:
             break
     return dates
+
+def get_live_option_cmp(index: str, strike: int, opt_type: str,
+                        expiry_str: str, vix: float) -> float | None:
+    """
+    Thin wrapper around eng.get_live_option_price — uses Black-Scholes with
+    the freshest live spot price fetched directly from NSE (12s cache in engine).
+    This is called every auto-trading cycle so CMP always reflects market moves.
+    """
+    return eng.get_live_option_price(index, int(strike), opt_type, expiry_str, vix)
 
 def update_kelly():
     j = st.session_state.journal
@@ -1292,9 +1299,10 @@ with page_tabs[1]:
                     st.error("🚫 VIX too high — blocked.")
         else:
             end_dt  = datetime.fromisoformat(st.session_state.auto_opt_end)
-            rem     = max(0.0, (end_dt - datetime.now()).total_seconds())
-            tot_s   = max(1.0, rem)
-            prog    = 1.0 - rem / tot_s
+            rem      = max(0.0, (end_dt - datetime.now()).total_seconds())
+            oa_dur_s = float(st.session_state.get("oa_dur", 30)) * 60.0
+            tot_s    = max(oa_dur_s, 1.0)
+            prog     = max(0.0, min(1.0, 1.0 - rem / tot_s))
 
             oc1, oc2, oc3, oc4 = st.columns(4)
             oc1.metric("Time Left", f"{int(rem//60)}m {int(rem%60)}s")
@@ -1306,8 +1314,14 @@ with page_tabs[1]:
 
             if rem <= 0:
                 for pos in st.session_state.opt_portfolio:
-                    ep2  = pos["entry"]; cmp2 = pos.get("cmp", ep2)
+                    ep2  = pos["entry"]
                     lots = pos["lots"];  ls   = pos["lot_size"]
+                    # Fetch fresh price even at session end
+                    live_end = get_live_option_cmp(
+                        pos["index"], pos["strike"], pos["type"],
+                        pos.get("expiry", str(exp_bn)), vix_val
+                    )
+                    cmp2 = live_end if (live_end is not None and live_end > 0) else pos.get("cmp", ep2)
                     gross = (cmp2 - ep2) * lots * ls
                     net   = gross - pos.get("brokerage", 0)
                     st.session_state.opt_history.append({
@@ -1394,7 +1408,14 @@ with page_tabs[1]:
                 still = []
                 for pos in st.session_state.opt_portfolio:
                     ep2  = pos["entry"]; lots = pos["lots"]; ls = pos["lot_size"]
-                    cmp2 = pos.get("cmp", ep2)
+                    # ── LIVE CMP: fetch fresh BS price using current spot ────
+                    live_p = get_live_option_cmp(
+                        pos["index"], pos["strike"], pos["type"],
+                        pos.get("expiry", str(exp_bn)), vix_val
+                    )
+                    cmp2 = live_p if (live_p is not None and live_p > 0) else pos.get("cmp", ep2)
+                    pos["cmp"] = cmp2                      # persist for display
+                    # ────────────────────────────────────────────────────────
                     gross = (cmp2 - ep2) * lots * ls
                     pos["pnl"] = round(gross - pos.get("brokerage", 0), 2)
                     pnl_pct = (cmp2 - ep2) / ep2 * 100 if ep2 > 0 else 0
@@ -1463,8 +1484,13 @@ with page_tabs[1]:
                 with stp2:
                     if st.button("🛑 STOP OPTIONS AUTO TRADING", key="opt_stop", use_container_width=True):
                         for pos in st.session_state.opt_portfolio:
-                            ep2  = pos["entry"]; cmp2 = pos.get("cmp", ep2)
+                            ep2  = pos["entry"]
                             lots = pos["lots"];  ls   = pos["lot_size"]
+                            live_stop = get_live_option_cmp(
+                                pos["index"], pos["strike"], pos["type"],
+                                pos.get("expiry", str(exp_bn)), vix_val
+                            )
+                            cmp2 = live_stop if (live_stop is not None and live_stop > 0) else pos.get("cmp", ep2)
                             gross = (cmp2 - ep2) * lots * ls
                             net   = gross - pos.get("brokerage", 0) - eng.options_cost(cmp2, lots, ls, "SELL")
                             st.session_state.opt_history.append({
@@ -1510,12 +1536,21 @@ with page_tabs[1]:
 
             for pos in st.session_state.opt_portfolio:
                 oc3   = "var(--accent)" if pos["type"] == "CE" else "var(--red)"
-                ep2   = pos["entry"]; lots = pos["lots"]; ls = pos["lot_size"]; pn = pos.get("pnl", 0)
+                ep2   = pos["entry"]; lots = pos["lots"]; ls = pos["lot_size"]
+                # ── LIVE CMP: refresh for open-positions display ─────────────
+                live_p2 = get_live_option_cmp(
+                    pos["index"], pos["strike"], pos["type"],
+                    pos.get("expiry", str(exp_bn)), vix_val
+                )
+                if live_p2 is not None and live_p2 > 0:
+                    pos["cmp"] = live_p2
+                    pos["pnl"] = round((live_p2 - ep2) * lots * ls - pos.get("brokerage", 0), 2)
+                pn = pos.get("pnl", 0)
                 trail3 = f" | Trail SL: ₹{pos['trailing_sl']:.2f}" if pos.get("trailing_sl") else ""
                 with st.expander(
                     f"{'🔵' if pos['type']=='CE' else '🔴'} "
                     f"{pos['index']} {pos['strike']:,} {pos['type']} | "
-                    f"Entry ₹{ep2:.2f} | {pos['lots']}L | {pnl_fmt(pn)}{trail3}"
+                    f"Entry ₹{ep2:.2f} | CMP ₹{pos.get('cmp',ep2):.2f} | {pos['lots']}L | {pnl_fmt(pn)}{trail3}"
                 ):
                     p1,p2,p3,p4,p5 = st.columns(5)
                     p1.metric("Entry",   f"₹{ep2:.2f}")
@@ -2216,7 +2251,12 @@ with page_tabs[3]:
                     "date": datetime.now().strftime("%Y-%m-%d"), "rec": pos.get("rec", ""),
                 })
             for pos in st.session_state.opt_portfolio:
-                ep2  = pos["entry"]; cmp2 = pos.get("cmp", ep2); lots = pos["lots"]; ls = pos["lot_size"]
+                ep2  = pos["entry"]; lots = pos["lots"]; ls = pos["lot_size"]
+                live_port = get_live_option_cmp(
+                    pos["index"], pos["strike"], pos["type"],
+                    pos.get("expiry", str(exp_bn)), vix_val
+                )
+                cmp2 = live_port if (live_port is not None and live_port > 0) else pos.get("cmp", ep2)
                 gross = (cmp2 - ep2) * lots * ls
                 net   = gross - pos.get("brokerage", 0) - eng.options_cost(cmp2, lots, ls, "SELL")
                 st.session_state.opt_history.append({
