@@ -256,6 +256,61 @@ def get_live_price(symbol: str) -> float | None:
     return None
 
 
+
+
+# ─── Live Option Price (BS-based, uses live spot) ─────────────────────────────
+_opt_price_cache: dict = {}
+
+def get_live_option_price(index: str, strike: int, opt_type: str,
+                          expiry_str: str, vix: float) -> float | None:
+    """
+    Return a live option premium using Black-Scholes with the freshest
+    available spot price for the underlying index.
+
+    Parameters
+    ----------
+    index      : "BANKNIFTY" or "NIFTY50"
+    strike     : integer strike price
+    opt_type   : "CE" or "PE"
+    expiry_str : ISO date string e.g. "2026-05-29"
+    vix        : current India VIX value
+
+    Cache TTL: 12 seconds (matches equity get_live_price TTL).
+    Falls back to stored CMP on any error — never crashes.
+    """
+    cache_key = f"opt_{index}_{strike}_{opt_type}_{expiry_str}"
+    cached = _opt_price_cache.get(cache_key)
+    if cached and (time.time() - cached["ts"]) < 12:
+        return cached["price"]
+
+    try:
+        # 1. Fetch live spot for the underlying index
+        idx_sym = "^NSEBANK" if index == "BANKNIFTY" else "^NSEI"
+        spot = get_live_price(idx_sym)
+        if not spot or spot <= 0:
+            # Fallback: re-use the last allIndices call
+            indices = get_all_indices()
+            spot = indices.get("BN" if index == "BANKNIFTY" else "NF", {}).get("p", 0)
+        if not spot or spot <= 0:
+            return None
+
+        # 2. Time to expiry
+        ex_date = date.fromisoformat(expiry_str)
+        dte = max(1, (ex_date - date.today()).days)
+        T   = dte / 365.0
+        r   = 0.065
+        iv  = max(0.08, vix / 100.0 * (1 + 0.05 * math.sqrt(T)))
+
+        # 3. Black-Scholes price — same formula used in build_chain
+        g = bs_greeks(spot, float(strike), T, r, iv, opt_type)
+        price = g.get("price", 0.0)
+        if price and price > 0:
+            _opt_price_cache[cache_key] = {"price": price, "ts": time.time()}
+            return price
+    except Exception:
+        pass
+    return None
+
 # ─── NSE Historical OHLCV (no login) ─────────────────────────────────────────
 
 def _nse_equity_history(symbol: str, from_date: date, to_date: date) -> pd.DataFrame | None:
