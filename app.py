@@ -467,7 +467,7 @@ with page_tabs[0]:
                                 "type":       "BUY" if "BUY" in r["rec"] else "SELL",
                                 "mode":       eq_mode,
                                 "entry":      r["price"],
-                                "cmp":        r["price"],
+                                "cmp":        eng.get_live_price(r["symbol"]) or r["price"],
                                 "qty":        qty2,
                                 "invested":   round(r["price"] * qty2, 2),
                                 "brokerage":  eng.equity_cost(r["price"], qty2, "BUY", eq_mode == "DELIVERY"),
@@ -613,7 +613,7 @@ with page_tabs[0]:
                             "symbol":     sig["symbol"],
                             "type":       "BUY" if "BUY" in sig["rec"] else "SELL",
                             "mode":       _mode,
-                            "entry":      p, "cmp": p,
+                            "entry":      p, "cmp": eng.get_live_price(sig["symbol"]) or p,
                             "qty":        qty3,
                             "invested":   round(p * qty3, 2),
                             "brokerage":  cost,
@@ -634,7 +634,11 @@ with page_tabs[0]:
 
                 still = []
                 for pos in st.session_state.eq_portfolio:
-                    lp  = eng.get_live_price(pos["symbol"]) or pos["entry"]
+                    # FIX: fall back to last known CMP (not entry price) so that
+                    # the display never freezes at the buying price when the API
+                    # is briefly unavailable between refresh cycles.
+                    _fetched = eng.get_live_price(pos["symbol"])
+                    lp = _fetched if (_fetched and _fetched > 0) else pos.get("cmp", pos["entry"])
                     pos["cmp"] = lp
                     ep2  = pos["entry"]; qty2 = pos["qty"]; cost = pos.get("brokerage", 0)
                     gross = (lp - ep2) * qty2 if pos["type"] == "BUY" else (ep2 - lp) * qty2
@@ -798,7 +802,9 @@ with page_tabs[0]:
             st.markdown("<br>", unsafe_allow_html=True)
 
             for pos in st.session_state.eq_portfolio:
-                lp  = eng.get_live_price(pos["symbol"]) or pos["entry"]
+                # FIX: use last known CMP as fallback so price never reverts to entry
+                _fetched_eq = eng.get_live_price(pos["symbol"])
+                lp = _fetched_eq if (_fetched_eq and _fetched_eq > 0) else pos.get("cmp", pos["entry"])
                 pos["cmp"] = lp
                 ep2  = pos["entry"]; qty2 = pos["qty"]; cost = pos.get("brokerage", 0)
                 gross = (lp - ep2) * qty2 if pos["type"] == "BUY" else (ep2 - lp) * qty2
@@ -1867,7 +1873,7 @@ with page_tabs[2]:
                                 "id":         f"{r['symbol']}_FUT_{int(time.time()*1000)}",
                                 "symbol":     r["symbol"],
                                 "type":       "LONG" if "BUY" in r["rec"] else "SHORT",
-                                "entry":      r["price"], "cmp": r["price"],
+                                "entry":      r["price"], "cmp": eng.get_live_price(r["symbol"]) or r["price"],
                                 "lots":       lots_f, "lot_size": lot_sz2,
                                 "margin":     round(margin2 * lots_f, 2),
                                 "brokerage":  cost_f,
@@ -2009,7 +2015,7 @@ with page_tabs[2]:
                             "id":         f"{sig['symbol']}_FUT_{int(time.time()*1000)}",
                             "symbol":     sig["symbol"],
                             "type":       "LONG" if "BUY" in sig["rec"] else "SHORT",
-                            "entry":      p3, "cmp": p3,
+                            "entry":      p3, "cmp": eng.get_live_price(sig["symbol"]) or p3,
                             "lots":       lots_f2, "lot_size": lot_sz3,
                             "margin":     round(margin3 * lots_f2, 2),
                             "brokerage":  cost_f2,
@@ -2029,7 +2035,10 @@ with page_tabs[2]:
 
                 fstill = []
                 for pos in st.session_state.fut_portfolio:
-                    lp2  = eng.get_live_price(pos["symbol"]) or pos["entry"]
+                    # FIX: fall back to last known CMP (not entry) so futures
+                    # price never reverts to the buying price on API hiccups.
+                    _fetched_fut = eng.get_live_price(pos["symbol"])
+                    lp2 = _fetched_fut if (_fetched_fut and _fetched_fut > 0) else pos.get("cmp", pos["entry"])
                     pos["cmp"] = lp2
                     ep2  = pos["entry"]; lots2 = pos["lots"]; ls2 = pos["lot_size"]; cost5 = pos.get("brokerage", 0)
                     gross2 = (lp2 - ep2) * lots2 * ls2 if pos["type"] == "LONG" else (ep2 - lp2) * lots2 * ls2
@@ -2186,7 +2195,9 @@ with page_tabs[2]:
             st.markdown("<br>", unsafe_allow_html=True)
 
             for pos in st.session_state.fut_portfolio:
-                lp4  = eng.get_live_price(pos["symbol"]) or pos["entry"]
+                # FIX: use last known CMP as fallback so price never reverts to entry
+                _fetched_fp = eng.get_live_price(pos["symbol"])
+                lp4 = _fetched_fp if (_fetched_fp and _fetched_fp > 0) else pos.get("cmp", pos["entry"])
                 pos["cmp"] = lp4
                 ep4  = pos["entry"]; lots4 = pos["lots"]; ls4 = pos["lot_size"]; cost8 = pos.get("brokerage", 0)
                 gross4 = (lp4 - ep4) * lots4 * ls4 if pos["type"] == "LONG" else (ep4 - lp4) * lots4 * ls4
@@ -2372,7 +2383,8 @@ with page_tabs[3]:
 
         if st.button("🛑 SQUARE OFF ALL POSITIONS", use_container_width=True, key="sq_all"):
             for pos in st.session_state.eq_portfolio:
-                lp  = eng.get_live_price(pos["symbol"]) or pos["entry"]
+                _f = eng.get_live_price(pos["symbol"])
+                lp  = _f if (_f and _f > 0) else pos.get("cmp", pos["entry"])
                 ep2 = pos["entry"]; qty2 = pos["qty"]
                 gross = (lp - ep2) * qty2 if pos["type"] == "BUY" else (ep2 - lp) * qty2
                 net   = gross - pos.get("brokerage", 0) - eng.equity_cost(lp, qty2, pos["type"], False)
@@ -2404,7 +2416,8 @@ with page_tabs[3]:
                     "date": datetime.now().strftime("%Y-%m-%d"), "rec": pos.get("signal", ""),
                 })
             for pos in st.session_state.fut_portfolio:
-                lp  = eng.get_live_price(pos["symbol"]) or pos["entry"]
+                _ff = eng.get_live_price(pos["symbol"])
+                lp  = _ff if (_ff and _ff > 0) else pos.get("cmp", pos["entry"])
                 ep2 = pos["entry"]; lots = pos["lots"]; ls = pos["lot_size"]
                 gross = (lp - ep2) * lots * ls if pos["type"] == "LONG" else (ep2 - lp) * lots * ls
                 net   = gross - pos.get("brokerage", 0) - eng.futures_cost(lp, lots, ls, pos["type"])
