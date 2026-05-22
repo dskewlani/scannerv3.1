@@ -372,8 +372,16 @@ with page_tabs[0]:
             st.dataframe(pd.DataFrame(tbl), use_container_width=True, hide_index=True)
             st.markdown("<br>", unsafe_allow_html=True)
 
+            # Deduplicate by symbol to prevent duplicate Streamlit button keys
+            seen_syms = set()
+            deduped_results = []
+            for r in results:
+                if r["symbol"] not in seen_syms:
+                    seen_syms.add(r["symbol"])
+                    deduped_results.append(r)
+
             st.markdown("#### 🔎 Detailed Cards")
-            for r in results[:40]:
+            for card_idx, r in enumerate(deduped_results[:40]):
                 icon = "🟢" if "BUY" in r["rec"] else ("🔴" if "SELL" in r["rec"] else "🟡")
                 with st.expander(
                     f"{icon} {r['symbol'].replace('.NS','').replace('.BO','')} | "
@@ -438,11 +446,11 @@ with page_tabs[0]:
                     bar_c = "#00e676" if "BUY" in r["rec"] else "#ff1744"
                     st.markdown(strength_bar(r["strength"], bar_c), unsafe_allow_html=True)
 
-                    kc  = eng.kelly_size(float(trade_cap), st.session_state.kelly_wr, r["rr"], r["strength"]) if use_kelly else float(trade_cap)
-                    qty = max(1, int(kc / r["price"])) if r["price"] > 0 else 1
+                    # Fixed allocation: ₹1 lakh per trade
+                    qty = max(1, int(100000 / r["price"])) if r["price"] > 0 else 1
                     cost = eng.equity_cost(r["price"], qty, "BUY", eq_mode == "DELIVERY")
                     st.markdown(
-                        f'<div class="info-b">🧮 Kelly Allocation: ₹{kc:,.0f} | '
+                        f'<div class="info-b">🧮 Fixed Allocation: ₹1,00,000 | '
                         f'Qty: {qty} shares | Est. Charges: ₹{cost:.2f}</div>',
                         unsafe_allow_html=True,
                     )
@@ -450,9 +458,9 @@ with page_tabs[0]:
                     bc1, bc2 = st.columns(2)
                     with bc1:
                         if r["rec"] not in ("NEUTRAL",) and st.button(
-                            f"🚀 EXECUTE {r['rec']}", key=f"eq_exec_{r['symbol']}"
+                            f"🚀 EXECUTE {r['rec']}", key=f"eq_exec_{r['symbol']}_{card_idx}"
                         ):
-                            qty2  = max(1, int(kc / r["price"])) if r["price"] > 0 else 1
+                            qty2  = max(1, int(100000 / r["price"])) if r["price"] > 0 else 1
                             trade = {
                                 "id":         f"{r['symbol']}_{int(time.time()*1000)}",
                                 "symbol":     r["symbol"],
@@ -683,7 +691,7 @@ with page_tabs[0]:
 
                 st.markdown("### Live Equity Positions")
                 if st.session_state.eq_portfolio:
-                    for pos in st.session_state.eq_portfolio:
+                    for at_idx, pos in enumerate(st.session_state.eq_portfolio):
                         pnl   = pos.get("pnl", 0)
                         trail = f" | Trail SL: ₹{pos['trailing_sl']:,.2f}" if pos.get("trailing_sl") else ""
                         cls   = "win" if pnl >= 0 else "loss"
@@ -699,6 +707,35 @@ with page_tabs[0]:
                                 <div>{pnl_fmt(pnl)}</div>
                             </div>
                         </div>""", unsafe_allow_html=True)
+                        # Per-line square off button
+                        if st.button(f"✅ Square Off {pos['symbol'].replace('.NS','')} {pos['type']}",
+                                     key=f"at_eq_sq_{pos['id']}_{at_idx}", use_container_width=False):
+                            lp_sq  = eng.get_live_price(pos["symbol"]) or pos["entry"]
+                            ep_sq  = pos["entry"]; qty_sq = pos["qty"]; cost_sq = pos.get("brokerage", 0)
+                            gross_sq = (lp_sq - ep_sq) * qty_sq if pos["type"] == "BUY" else (ep_sq - lp_sq) * qty_sq
+                            cost_sq2 = eng.equity_cost(lp_sq, qty_sq, pos["type"], _mode == "DELIVERY")
+                            net_sq   = gross_sq - cost_sq - cost_sq2
+                            st.session_state.eq_history.append({
+                                **pos, "exit": lp_sq, "pnl": round(net_sq, 2),
+                                "status": "CLOSED",
+                                "exit_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            })
+                            st.session_state.journal.append({
+                                "cat": "EQUITY", "symbol": pos["symbol"],
+                                "pnl": round(net_sq, 2), "win": net_sq >= 0,
+                                "strength": pos.get("strength", 0),
+                                "date": datetime.now().strftime("%Y-%m-%d"),
+                                "rec": pos.get("rec", ""),
+                            })
+                            st.session_state.eq_portfolio = [
+                                p for p in st.session_state.eq_portfolio if p["id"] != pos["id"]
+                            ]
+                            db.save("eq_portfolio", st.session_state.eq_portfolio)
+                            db.save("eq_history",   st.session_state.eq_history)
+                            db.save("journal",      st.session_state.journal)
+                            update_kelly()
+                            st.success(f"✅ Squared off {pos['symbol']} @ ₹{lp_sq:.2f} | P&L: ₹{net_sq:+,.0f}")
+                            st.rerun()
 
                 stp, _ = st.columns([1, 3])
                 with stp:
@@ -1463,7 +1500,7 @@ with page_tabs[1]:
 
                 st.markdown("### Live Options Positions")
                 if st.session_state.opt_portfolio:
-                    for pos in st.session_state.opt_portfolio:
+                    for at_oi, pos in enumerate(st.session_state.opt_portfolio):
                         oc2   = "var(--accent)" if pos["type"] == "CE" else "var(--red)"
                         trail2 = f" | Trail SL: ₹{pos['trailing_sl']:.2f}" if pos.get("trailing_sl") else ""
                         pn    = pos.get("pnl", 0)
@@ -1477,6 +1514,39 @@ with page_tabs[1]:
                             {pos['lots']}L{trail2}</span>
                             {pnl_fmt(pn)}
                         </div></div>""", unsafe_allow_html=True)
+                        # Per-line square off button
+                        if st.button(f"✅ Square Off {pos['index']} {pos['strike']:,} {pos['type']}",
+                                     key=f"at_opt_sq_{pos['id']}_{at_oi}"):
+                            ep_osq  = pos["entry"]; lots_osq = pos["lots"]; ls_osq = pos["lot_size"]
+                            live_osq = get_live_option_cmp(
+                                pos["index"], pos["strike"], pos["type"],
+                                pos.get("expiry", str(exp_bn)), vix_val
+                            )
+                            cmp_osq = live_osq if (live_osq is not None and live_osq > 0) else pos.get("cmp", ep_osq)
+                            gross_osq = (cmp_osq - ep_osq) * lots_osq * ls_osq
+                            net_osq   = gross_osq - pos.get("brokerage", 0) - eng.options_cost(cmp_osq, lots_osq, ls_osq, "SELL")
+                            st.session_state.opt_history.append({
+                                **pos, "exit": cmp_osq, "pnl": round(net_osq, 2),
+                                "status": "CLOSED",
+                                "exit_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            })
+                            st.session_state.journal.append({
+                                "cat": "OPTIONS",
+                                "symbol": f"{pos['index']}{pos['strike']}{pos['type']}",
+                                "pnl": round(net_osq, 2), "win": net_osq >= 0,
+                                "strength": pos.get("strength", 0),
+                                "date": datetime.now().strftime("%Y-%m-%d"),
+                                "rec": pos.get("signal", ""),
+                            })
+                            st.session_state.opt_portfolio = [
+                                p for p in st.session_state.opt_portfolio if p["id"] != pos["id"]
+                            ]
+                            db.save("opt_portfolio", st.session_state.opt_portfolio)
+                            db.save("opt_history",   st.session_state.opt_history)
+                            db.save("journal",       st.session_state.journal)
+                            update_kelly()
+                            st.success(f"✅ Squared off {pos['index']} {pos['strike']} {pos['type']} @ ₹{cmp_osq:.2f} | P&L: ₹{net_osq:+,.0f}")
+                            st.rerun()
                 else:
                     st.info("No open options positions. Scanning next cycle…")
 
@@ -1983,7 +2053,7 @@ with page_tabs[2]:
 
                 st.markdown("### Live Futures Positions")
                 if st.session_state.fut_portfolio:
-                    for pos in st.session_state.fut_portfolio:
+                    for at_fi, pos in enumerate(st.session_state.fut_portfolio):
                         pc3   = "var(--green)" if pos["type"] == "LONG" else "var(--red)"
                         trail4 = f" | Trail: ₹{pos['trailing_sl']:.2f}" if pos.get("trailing_sl") else ""
                         pn2   = pos.get("pnl", 0)
@@ -1997,6 +2067,35 @@ with page_tabs[2]:
                             {pos['lots']}L{trail4}</span>
                             {pnl_fmt(pn2)}
                         </div></div>""", unsafe_allow_html=True)
+                        # Per-line square off button
+                        if st.button(f"✅ Square Off {pos['symbol'].replace('.NS','')} {pos['type']}",
+                                     key=f"at_fut_sq_{pos['id']}_{at_fi}"):
+                            lp_fsq  = eng.get_live_price(pos["symbol"]) or pos["entry"]
+                            ep_fsq  = pos["entry"]; lots_fsq = pos["lots"]; ls_fsq = pos["lot_size"]
+                            gross_fsq = (lp_fsq - ep_fsq) * lots_fsq * ls_fsq if pos["type"] == "LONG" else (ep_fsq - lp_fsq) * lots_fsq * ls_fsq
+                            cost_fsq  = eng.futures_cost(lp_fsq, lots_fsq, ls_fsq, pos["type"])
+                            net_fsq   = gross_fsq - pos.get("brokerage", 0) - cost_fsq
+                            st.session_state.fut_history.append({
+                                **pos, "exit": lp_fsq, "pnl": round(net_fsq, 2),
+                                "status": "CLOSED",
+                                "exit_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            })
+                            st.session_state.journal.append({
+                                "cat": "FUTURES", "symbol": pos["symbol"],
+                                "pnl": round(net_fsq, 2), "win": net_fsq >= 0,
+                                "strength": pos.get("strength", 0),
+                                "date": datetime.now().strftime("%Y-%m-%d"),
+                                "rec": pos.get("rec", ""),
+                            })
+                            st.session_state.fut_portfolio = [
+                                p for p in st.session_state.fut_portfolio if p["id"] != pos["id"]
+                            ]
+                            db.save("fut_portfolio", st.session_state.fut_portfolio)
+                            db.save("fut_history",   st.session_state.fut_history)
+                            db.save("journal",       st.session_state.journal)
+                            update_kelly()
+                            st.success(f"✅ Squared off {pos['symbol']} {pos['type']} @ ₹{lp_fsq:.2f} | P&L: ₹{net_fsq:+,.0f}")
+                            st.rerun()
                 else:
                     st.info("No open futures positions. Scanning next cycle…")
 
