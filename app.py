@@ -2948,7 +2948,13 @@ with page_tabs[8]:
         mcx_amt_auto = st.number_input("MCX auto amount per trade (₹)", 1000, 10000000, 100000, 5000, key="mcx_auto_amt_new")
         mcx_max_auto = st.number_input("MCX auto max lines", 1, 10, 3, 1, key="mcx_auto_max_new")
         if st.button("Start MCX Auto", key="mcx_auto_start_new"):
-            st.session_state.auto_mcx = True; st.session_state.mcx_auto_amt_new = float(mcx_amt_auto); st.session_state.mcx_auto_max_new = int(mcx_max_auto); db.save("auto_mcx", True); st.rerun()
+           st.session_state["auto_mcx"] = True
+           st.session_state["mcx_auto_amt"] = float(mcx_amt_auto)
+           st.session_state["mcx_auto_max"] = int(mcx_max_auto)
+
+           db.save("auto_mcx", True)
+
+           st.rerun()
     else:
         amt = float(st.session_state.get("mcx_auto_amt_new", 100000)); mx = int(st.session_state.get("mcx_auto_max_new", 3)); existing = {p["symbol"] for p in st.session_state.mcx_portfolio}
         for sym2 in eng.MCX_SYMBOLS:
