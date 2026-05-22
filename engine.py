@@ -292,9 +292,9 @@ def get_live_option_price(index: str, strike: int, opt_type: str,
             indices = get_all_indices()
             spot = indices.get("BN" if index == "BANKNIFTY" else "NF", {}).get("p", 0)
         if not spot or spot <= 0:
-    return None
+          return None
 
-pct = (K - spot) / spot * 100 if otype == "CE" else (spot - K) / spot * 100
+        pct = (K - spot) / spot * 100 if otype == "CE" else (spot - K) / spot * 100
 
         # 2. Time to expiry
         ex_date = date.fromisoformat(expiry_str)
