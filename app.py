@@ -14,7 +14,7 @@ import math
 
 import storage as db
 
-import engine as eng
+import engine_mcx_etf_live as eng
 from ui import (
     TERMINAL_CSS, sig_badge, strength_bar, pnl_fmt,
     ticker_item, metric_card, level_box, profit_book_row, greek_box
@@ -39,6 +39,10 @@ def load_persistent():
             ("opt_history",   []),
             ("fut_portfolio", []),
             ("fut_history",   []),
+            ("etf_portfolio", []),
+            ("etf_history",   []),
+            ("mcx_portfolio", []),
+            ("mcx_history",   []),
             ("journal",       []),
             ("kelly_wr",      0.55),
             ("scan_eq",       []),
@@ -47,9 +51,13 @@ def load_persistent():
             ("auto_eq",       False),
             ("auto_opt",      False),
             ("auto_fut",      False),
+            ("auto_etf",      False),
+            ("auto_mcx",      False),
             ("auto_eq_end",   None),
             ("auto_opt_end",  None),
             ("auto_fut_end",  None),
+            ("auto_etf_end",  None),
+            ("auto_mcx_end",  None),
         ]:
             st.session_state[key] = db.load(key, default)
         st.session_state["loaded"] = True
@@ -58,7 +66,7 @@ load_persistent()
 
 def save_all():
     for key in ["eq_portfolio","eq_history","opt_portfolio","opt_history",
-                "fut_portfolio","fut_history","journal","kelly_wr"]:
+                "fut_portfolio","fut_history","etf_portfolio","etf_history","mcx_portfolio","mcx_history","journal","kelly_wr"]:
         db.save(key, st.session_state[key])
 
 # ─── Safe number_input helper ─────────────────────────────────────────────────
@@ -112,6 +120,36 @@ def update_kelly():
         wins = sum(1 for x in j if x.get("win", False))
         st.session_state.kelly_wr = wins / len(j)
         db.save("kelly_wr", st.session_state.kelly_wr)
+
+
+def amount_to_qty(amount, price):
+    try: return max(1, int(float(amount) / max(float(price), 0.01)))
+    except Exception: return 1
+
+def amount_to_lots(amount, price, lot_size):
+    try: return max(1, int(float(amount) / max(float(price) * int(lot_size), 1.0)))
+    except Exception: return 1
+
+def refresh_all_open_positions(force=False):
+    now = time.time()
+    if not force and now - st.session_state.get("last_live_refresh_ts", 0) < 5: return
+    symbols = [p.get("symbol", "") for p in st.session_state.eq_portfolio + st.session_state.fut_portfolio + st.session_state.etf_portfolio + st.session_state.mcx_portfolio]
+    try: eng.force_refresh_live_prices([s for s in symbols if s])
+    except Exception: pass
+    for bucket in ["eq_portfolio", "etf_portfolio"]:
+        for pos in st.session_state.get(bucket, []):
+            lp = eng.get_live_price(pos["symbol"]) or pos.get("cmp", pos["entry"]); pos["cmp"] = lp
+            gross = (lp - pos["entry"]) * pos.get("qty", 0) if pos.get("type") == "BUY" else (pos["entry"] - lp) * pos.get("qty", 0)
+            pos["pnl"] = round(gross - pos.get("brokerage", 0), 2)
+        db.save(bucket, st.session_state[bucket])
+    for bucket in ["fut_portfolio", "mcx_portfolio"]:
+        for pos in st.session_state.get(bucket, []):
+            lp = eng.get_live_price(pos["symbol"]) or pos.get("cmp", pos["entry"]); pos["cmp"] = lp
+            gross = (lp - pos["entry"]) * pos.get("lots", 1) * pos.get("lot_size", 1) if pos.get("type") in ("LONG", "BUY") else (pos["entry"] - lp) * pos.get("lots", 1) * pos.get("lot_size", 1)
+            pos["pnl"] = round(gross - pos.get("brokerage", 0), 2)
+        db.save(bucket, st.session_state[bucket])
+    st.session_state["last_live_refresh_ts"] = now
+refresh_all_open_positions()
 
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -273,7 +311,7 @@ st.markdown("<br>", unsafe_allow_html=True)
 # ─── MAIN TABS ────────────────────────────────────────────────────────────────
 page_tabs = st.tabs([
     "📈 EQUITY", "⚡ OPTIONS", "🔮 FUTURES",
-    "💼 PORTFOLIO", "📜 HISTORY", "📓 JOURNAL", "📊 ANALYTICS"
+    "💼 PORTFOLIO", "📜 HISTORY", "📓 JOURNAL", "📊 ANALYTICS", "💹 ETF", "⛏ MCX"
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -508,6 +546,7 @@ with page_tabs[0]:
                 a_dur  = st.number_input("Duration (minutes)", 1, 390, 30, 5, key="eq_dur")
                 a_mode = st.radio("Trading Mode", ["INTRADAY", "DELIVERY"], horizontal=True, key="eq_at_mode")
                 a_max  = st.number_input("Max simultaneous positions", 1, 20, 5, 1, key="eq_max")
+                a_amt  = st.number_input("Amount per auto trade (₹)", 1000, 10000000, 100000, 5000, key="eq_auto_amt")
                 _eq_scan_max = max(50, len(eng.NSE_SYMBOLS))
                 a_scan = st.number_input(
                     "Stocks to scan per cycle", 50, _eq_scan_max,
@@ -526,6 +565,7 @@ with page_tabs[0]:
                     st.session_state["eq_at_mode2"]  = a_mode
                     st.session_state["eq_at_max"]    = int(a_max)
                     st.session_state["eq_at_scan"]   = int(a_scan)
+                    st.session_state["eq_at_amt"]    = float(a_amt)
                     st.session_state["eq_total_s"]   = float(a_dur) * 60.0
                     st.session_state["eq_start_ts"]  = time.time()
                     db.save("auto_eq",     True)
@@ -584,6 +624,7 @@ with page_tabs[0]:
                 _max  = st.session_state.get("eq_at_max",  5)
                 _mode = st.session_state.get("eq_at_mode2", "INTRADAY")
                 _sc   = st.session_state.get("eq_at_scan",  200)
+                _amt  = float(st.session_state.get("eq_at_amt", trade_cap))
 
                 if len(st.session_state.eq_portfolio) < _max:
                     with st.spinner("Scanning for signals…"):
@@ -605,8 +646,8 @@ with page_tabs[0]:
                         p = sig["price"]
                         if p <= 0:
                             continue
-                        kc2  = eng.kelly_size(float(trade_cap), st.session_state.kelly_wr, sig["rr"], sig["strength"]) if use_kelly else float(trade_cap)
-                        qty3 = max(1, int(kc2 / p))
+                        kc2  = eng.kelly_size(_amt, st.session_state.kelly_wr, sig["rr"], sig["strength"]) if use_kelly else _amt
+                        qty3 = amount_to_qty(kc2, p)
                         cost = eng.equity_cost(p, qty3, "BUY", _mode == "DELIVERY")
                         trade = {
                             "id":         f"{sig['symbol']}_{int(time.time()*1000)}",
@@ -782,7 +823,7 @@ with page_tabs[0]:
                         update_kelly()
                         st.rerun()
 
-                time.sleep(10)
+                time.sleep(5)
                 st.rerun()
 
     # ── EQ Open Positions ─────────────────────────────────────────────────────
@@ -1324,6 +1365,7 @@ with page_tabs[1]:
             with oa2:
                 oa_dur = st.number_input("Duration (minutes)", 1, 390, 30, 5, key="oa_dur")
                 oa_max = st.number_input("Max simultaneous positions", 1, 10, 3, 1, key="oa_max")
+                oa_amt = st.number_input("Amount per auto trade (₹)", 1000, 10000000, 100000, 5000, key="oa_amt")
                 oa_idx = st.multiselect("Trade Indices", ["BANKNIFTY","NIFTY50"],
                                         default=["BANKNIFTY","NIFTY50"], key="oa_idx")
                 oa_str = st.number_input("Min signal strength", 50, 95, 60, 5, key="oa_str")
@@ -1342,6 +1384,7 @@ with page_tabs[1]:
                         st.session_state["oa_max2"]    = int(oa_max)
                         st.session_state["oa_idx2"]    = oa_idx
                         st.session_state["oa_str2"]    = int(oa_str)
+                        st.session_state["oa_amt2"]    = float(oa_amt)
                         st.session_state["oa_total_s"] = float(oa_dur) * 60.0
                         st.session_state["oa_start_ts"] = time.time()
                         db.save("auto_opt",     True)
@@ -1409,6 +1452,7 @@ with page_tabs[1]:
                 _max  = st.session_state.get("oa_max2", 3)
                 _idxs = st.session_state.get("oa_idx2", ["BANKNIFTY"])
                 _str  = st.session_state.get("oa_str2", 60)
+                _amt  = float(st.session_state.get("oa_amt2", 100000))
 
                 if len(st.session_state.opt_portfolio) < _max and vix_val <= 28:
                     with st.spinner("Scanning options chains…"):
@@ -1444,9 +1488,8 @@ with page_tabs[1]:
                         if k in existing: continue
                         lot  = sig["lot"]; pr2 = sig["price"]
                         # Minimum ₹1 lakh per trade: lots = ceil(100000 / (pr2 * lot))
-                        min_lots = max(1, math.ceil(100000 / max(pr2 * lot, 1)))
-                        kelly_lots = max(1, int(eng.kelly_size(float(trade_cap), st.session_state.kelly_wr, 1.5, sig["strength"]) / max(pr2 * lot, 1))) if use_kelly else 1
-                        lots2 = max(min_lots, kelly_lots)
+                        kelly_amount = eng.kelly_size(_amt, st.session_state.kelly_wr, 1.5, sig["strength"]) if use_kelly else _amt
+                        lots2 = amount_to_lots(kelly_amount, pr2, lot)
                         cost2 = eng.options_cost(pr2, lots2, lot, "BUY")
                         trade = {
                             "id":         f"{sig['index']}{sig['strike']}{sig['type']}_{int(time.time()*1000)}",
@@ -1536,7 +1579,7 @@ with page_tabs[1]:
                 update_kelly()
 
                 # Auto-refresh every 15s while trading is active
-                st.caption(f"🔄 Auto-refreshing every 15s | Last: {datetime.now().strftime('%H:%M:%S')}")
+                st.caption(f"🔄 Auto-refreshing every 5s | Last: {datetime.now().strftime('%H:%M:%S')}")
                 st.markdown("### Live Options Positions")
                 if st.session_state.opt_portfolio:
                     for at_oi, pos in enumerate(st.session_state.opt_portfolio):
@@ -1626,7 +1669,7 @@ with page_tabs[1]:
                         db.save("journal",      st.session_state.journal)
                         update_kelly()
                         st.rerun()
-                time.sleep(10)
+                time.sleep(5)
                 st.rerun()
 
     # ── Options Open Positions ────────────────────────────────────────────────
@@ -1933,6 +1976,7 @@ with page_tabs[2]:
                 fa_dur = st.number_input("Duration (minutes)", 1, 390, 30, 5, key="fa_dur")
                 fa_max = st.number_input("Max simultaneous positions", 1, 10, 3, 1, key="fa_max")
                 fa_str = st.number_input("Min signal strength", 50, 95, 60, 5, key="fa_str")
+                fa_amt = st.number_input("Amount per auto trade (₹)", 1000, 10000000, 100000, 5000, key="fa_amt")
                 _fa_total = max(1, len(eng.FUTURES_SYMBOLS))
                 _fa_min   = min(10, _fa_total)
                 _fa_step  = max(1, _fa_total // 10)
@@ -1951,6 +1995,7 @@ with page_tabs[2]:
                     st.session_state["fa_max2"]    = int(fa_max)
                     st.session_state["fa_str2"]    = int(fa_str)
                     st.session_state["fa_scan2"]   = int(fa_scan)
+                    st.session_state["fa_amt2"]    = float(fa_amt)
                     st.session_state["fa_total_s"] = float(fa_dur) * 60.0
                     st.session_state["fa_start_ts"] = time.time()
                     db.save("auto_fut",     True)
@@ -2007,6 +2052,7 @@ with page_tabs[2]:
                 _fmax  = st.session_state.get("fa_max2", 3)
                 _fstr  = st.session_state.get("fa_str2", 60)
                 _fscan = st.session_state.get("fa_scan2", max(1, len(eng.FUTURES_SYMBOLS)))
+                _famt  = float(st.session_state.get("fa_amt2", 100000))
 
                 if len(st.session_state.fut_portfolio) < _fmax:
                     with st.spinner("Scanning futures…"):
@@ -2024,10 +2070,8 @@ with page_tabs[2]:
                         lot_sz3  = 25 if "NIFTY" in sig["symbol"] else (15 if "BANK" in sig["symbol"] else 1)
                         margin3  = round(p3 * lot_sz3 * 0.12, 0)
                         # Minimum ₹1 lakh per trade: lots = ceil(100000 / margin_per_lot)
-                        min_lots_f = max(1, math.ceil(100000 / max(margin3, 1)))
-                        kc_f2      = eng.kelly_size(float(trade_cap), st.session_state.kelly_wr, sig["rr"], sig["strength"]) if use_kelly else float(trade_cap)
-                        kelly_lots_f = max(1, int(kc_f2 / max(margin3, 1)))
-                        lots_f2    = max(min_lots_f, kelly_lots_f)
+                        kc_f2      = eng.kelly_size(_famt, st.session_state.kelly_wr, sig["rr"], sig["strength"]) if use_kelly else _famt
+                        lots_f2    = max(1, int(kc_f2 / max(margin3, 1)))
                         cost_f2    = eng.futures_cost(p3, lots_f2, lot_sz3, "BUY")
                         trade_f2   = {
                             "id":         f"{sig['symbol']}_FUT_{int(time.time()*1000)}",
@@ -2113,7 +2157,7 @@ with page_tabs[2]:
                 update_kelly()
 
                 # Auto-refresh every 12s while trading is active
-                st.caption(f"🔄 Auto-refreshing every 12s | Last: {datetime.now().strftime('%H:%M:%S')}")
+                st.caption(f"🔄 Auto-refreshing every 5s | Last: {datetime.now().strftime('%H:%M:%S')}")
                 st.markdown("### Live Futures Positions")
                 if st.session_state.fut_portfolio:
                     for at_fi, pos in enumerate(st.session_state.fut_portfolio):
@@ -2195,7 +2239,7 @@ with page_tabs[2]:
                         db.save("journal",     st.session_state.journal)
                         update_kelly()
                         st.rerun()
-                time.sleep(10)
+                time.sleep(5)
                 st.rerun()
 
     # ── Futures Open Positions ────────────────────────────────────────────────
@@ -2838,6 +2882,82 @@ with page_tabs[6]:
             unsafe_allow_html=True,
         )
 
+
+with page_tabs[7]:
+    st.markdown('<div class="sec-ttl">ETF TRADING - LIVE 5 SECOND CMP</div>', unsafe_allow_html=True)
+    for sym in eng.ETF_SYMBOLS:
+        lp = eng.get_live_price(sym) or 0
+        c1, c2, c3, c4 = st.columns([2,1,1,1])
+        c1.write(f"{sym.replace('.NS','')} CMP ₹{lp:,.2f}")
+        side = c2.selectbox("Side", ["BUY", "SELL"], key=f"etf_side_{sym}")
+        qty = c3.number_input("Qty", 1, 1000000, amount_to_qty(trade_cap, lp), 1, key=f"etf_qty_{sym}")
+        if c4.button("Trade", key=f"etf_trade_{sym}") and lp > 0:
+            cost = eng.equity_cost(lp, int(qty), side, True)
+            st.session_state.etf_portfolio.append({"id": f"ETF_{sym}_{int(time.time()*1000)}", "symbol": sym, "type": side, "entry": lp, "cmp": lp, "qty": int(qty), "invested": round(lp*int(qty),2), "brokerage": cost, "pnl": 0.0, "entry_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "entry_dt": datetime.now().isoformat()})
+            db.save("etf_portfolio", st.session_state.etf_portfolio); st.rerun()
+    st.markdown('### ETF Auto Trading')
+    if not st.session_state.auto_etf:
+        etf_amt_auto = st.number_input("ETF auto amount per trade (₹)", 1000, 10000000, 100000, 5000, key="etf_auto_amt_new")
+        etf_max_auto = st.number_input("ETF auto max lines", 1, 10, 3, 1, key="etf_auto_max_new")
+        if st.button("Start ETF Auto", key="etf_auto_start_new"):
+            st.session_state.auto_etf = True; st.session_state.etf_auto_amt_new = float(etf_amt_auto); st.session_state.etf_auto_max_new = int(etf_max_auto); db.save("auto_etf", True); st.rerun()
+    else:
+        amt = float(st.session_state.get("etf_auto_amt_new", 100000)); mx = int(st.session_state.get("etf_auto_max_new", 3)); existing = {p["symbol"] for p in st.session_state.etf_portfolio}
+        for sym2 in eng.ETF_SYMBOLS:
+            if len(st.session_state.etf_portfolio) >= mx: break
+            if sym2 in existing: continue
+            lp2 = eng.get_live_price(sym2)
+            if lp2 and lp2 > 0:
+                qty2 = amount_to_qty(amt, lp2); cost2 = eng.equity_cost(lp2, qty2, "BUY", True)
+                st.session_state.etf_portfolio.append({"id": f"AUTO_ETF_{sym2}_{int(time.time()*1000)}", "symbol": sym2, "type": "BUY", "entry": lp2, "cmp": lp2, "qty": qty2, "invested": round(lp2*qty2,2), "brokerage": cost2, "pnl": 0.0, "entry_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "entry_dt": datetime.now().isoformat()}); existing.add(sym2)
+        db.save("etf_portfolio", st.session_state.etf_portfolio)
+        if st.button("Stop ETF Auto", key="etf_auto_stop_new"):
+            st.session_state.auto_etf = False; db.save("auto_etf", False); st.rerun()
+    refresh_all_open_positions(force=True)
+    st.markdown('### ETF Open Positions')
+    for pos in list(st.session_state.etf_portfolio):
+        st.write(f"{pos['type']} {pos['symbol']} Entry ₹{pos['entry']:.2f} CMP ₹{pos.get('cmp',pos['entry']):.2f} P&L ₹{pos.get('pnl',0):+,.0f}")
+        if st.button(f"Square Off ETF {pos['id']}"):
+            st.session_state.etf_portfolio = [p for p in st.session_state.etf_portfolio if p['id'] != pos['id']]
+            db.save("etf_portfolio", st.session_state.etf_portfolio); st.rerun()
+
+with page_tabs[8]:
+    st.markdown('<div class="sec-ttl">MCX TRADING - ANGEL ONE LTP WHEN CONFIGURED</div>', unsafe_allow_html=True)
+    for sym in eng.MCX_SYMBOLS:
+        lp = eng.get_live_price(sym) or eng.MCX_BASE_PRICES.get(sym, 0); lot = eng.MCX_LOT_SIZES.get(sym, 1)
+        c1, c2, c3, c4 = st.columns([2,1,1,1])
+        c1.write(f"{sym} CMP ₹{lp:,.2f} Lot {lot}")
+        side = c2.selectbox("Side", ["LONG", "SHORT"], key=f"mcx_side_{sym}")
+        lots = c3.number_input("Lots", 1, 1000, amount_to_lots(trade_cap, lp, lot), 1, key=f"mcx_lots_{sym}")
+        if c4.button("Trade", key=f"mcx_trade_{sym}") and lp > 0:
+            cost = eng.futures_cost(lp, int(lots), lot, side)
+            st.session_state.mcx_portfolio.append({"id": f"MCX_{sym}_{int(time.time()*1000)}", "symbol": sym, "type": side, "entry": lp, "cmp": lp, "lots": int(lots), "lot_size": lot, "margin": round(lp*int(lots)*lot*0.12,2), "brokerage": cost, "pnl": 0.0, "entry_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "entry_dt": datetime.now().isoformat()})
+            db.save("mcx_portfolio", st.session_state.mcx_portfolio); st.rerun()
+    st.markdown('### MCX Auto Trading')
+    if not st.session_state.auto_mcx:
+        mcx_amt_auto = st.number_input("MCX auto amount per trade (₹)", 1000, 10000000, 100000, 5000, key="mcx_auto_amt_new")
+        mcx_max_auto = st.number_input("MCX auto max lines", 1, 10, 3, 1, key="mcx_auto_max_new")
+        if st.button("Start MCX Auto", key="mcx_auto_start_new"):
+            st.session_state.auto_mcx = True; st.session_state.mcx_auto_amt_new = float(mcx_amt_auto); st.session_state.mcx_auto_max_new = int(mcx_max_auto); db.save("auto_mcx", True); st.rerun()
+    else:
+        amt = float(st.session_state.get("mcx_auto_amt_new", 100000)); mx = int(st.session_state.get("mcx_auto_max_new", 3)); existing = {p["symbol"] for p in st.session_state.mcx_portfolio}
+        for sym2 in eng.MCX_SYMBOLS:
+            if len(st.session_state.mcx_portfolio) >= mx: break
+            if sym2 in existing: continue
+            lp2 = eng.get_live_price(sym2) or eng.MCX_BASE_PRICES.get(sym2, 0); lot2 = eng.MCX_LOT_SIZES.get(sym2, 1)
+            if lp2 and lp2 > 0:
+                lots2 = amount_to_lots(amt, lp2, lot2); cost2 = eng.futures_cost(lp2, lots2, lot2, "LONG")
+                st.session_state.mcx_portfolio.append({"id": f"AUTO_MCX_{sym2}_{int(time.time()*1000)}", "symbol": sym2, "type": "LONG", "entry": lp2, "cmp": lp2, "lots": lots2, "lot_size": lot2, "margin": round(lp2*lots2*lot2*0.12,2), "brokerage": cost2, "pnl": 0.0, "entry_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "entry_dt": datetime.now().isoformat()}); existing.add(sym2)
+        db.save("mcx_portfolio", st.session_state.mcx_portfolio)
+        if st.button("Stop MCX Auto", key="mcx_auto_stop_new"):
+            st.session_state.auto_mcx = False; db.save("auto_mcx", False); st.rerun()
+    refresh_all_open_positions(force=True)
+    st.markdown('### MCX Open Positions')
+    for pos in list(st.session_state.mcx_portfolio):
+        st.write(f"{pos['type']} {pos['symbol']} Entry ₹{pos['entry']:.2f} CMP ₹{pos.get('cmp',pos['entry']):.2f} P&L ₹{pos.get('pnl',0):+,.0f}")
+        if st.button(f"Square Off MCX {pos['id']}"):
+            st.session_state.mcx_portfolio = [p for p in st.session_state.mcx_portfolio if p['id'] != pos['id']]
+            db.save("mcx_portfolio", st.session_state.mcx_portfolio); st.rerun()
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.markdown("<br>", unsafe_allow_html=True)
 st.markdown(f"""
@@ -2848,5 +2968,15 @@ text-align:center;font-family:'JetBrains Mono';font-size:0.65rem;color:var(--mut
     <span style="color:var(--red);">⚠ Educational simulator — not investment advice</span>
 </div>""", unsafe_allow_html=True)
 
+if (st.session_state.eq_portfolio or st.session_state.opt_portfolio or st.session_state.fut_portfolio or st.session_state.etf_portfolio or st.session_state.mcx_portfolio):
+    if not (st.session_state.auto_eq or st.session_state.auto_opt or st.session_state.auto_fut or st.session_state.auto_etf or st.session_state.auto_mcx):
+        time.sleep(5)
+        st.rerun()
 # ── Auto-save on every render ──────────────────────────────────────────────────
 save_all()
+
+
+
+
+
+
