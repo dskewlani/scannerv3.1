@@ -2890,7 +2890,7 @@ with page_tabs[7]:
         c1, c2, c3, c4 = st.columns([2,1,1,1])
         c1.write(f"{sym.replace('.NS','')} CMP ₹{lp:,.2f}")
         side = c2.selectbox("Side", ["BUY", "SELL"], key=f"etf_side_{sym}")
-       calc_qty = max(1, min(amount_to_qty(trade_amt, lp), 1000000))
+        calc_qty = max(1, min(amount_to_qty(trade_amt, lp), 1000000))
 
         qty = c3.number_input(
             "Qty",
