@@ -2890,13 +2890,16 @@ with page_tabs[7]:
         c1, c2, c3, c4 = st.columns([2,1,1,1])
         c1.write(f"{sym.replace('.NS','')} CMP ₹{lp:,.2f}")
         side = c2.selectbox("Side", ["BUY", "SELL"], key=f"etf_side_{sym}")
+        trade_amt = st.session_state.get("trade_amt", 100000)
         calc_qty = max(1, min(amount_to_qty(trade_amt, lp), 1000000))
+        
 
         qty = c3.number_input(
             "Qty",
             min_value=1,
             max_value=1000000,
             value=calc_qty
+            key=f"etf_qty_{sym}"
         )
         if c4.button("Trade", key=f"etf_trade_{sym}") and lp > 0:
             cost = eng.equity_cost(lp, int(qty), side, True)
