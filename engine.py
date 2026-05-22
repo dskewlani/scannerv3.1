@@ -1460,7 +1460,10 @@ def _option_signal(spot, K, atm, ind_u, df_u, otype, delta, dte, vix, iv_percent
     if vix > 20:  score += 1
     elif vix < 13: score += 1
 
-    pct = (K - spot) / spot * 100 if otype == "CE" else (spot - K) / spot * 100
+    if not spot or spot == 0:
+    return None  # or some sentinel value like {}
+
+pct = (K - spot) / spot * 100 if otype == "CE" else (spot - K) / spot * 100
     if 0 <= pct <= 0.5:    score += 2
     elif 0.5 < pct <= 1.5: score += 1
     elif pct > 3:          score -= 2
