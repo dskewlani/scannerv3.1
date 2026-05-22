@@ -519,13 +519,15 @@ with page_tabs[0]:
                     unsafe_allow_html=True,
                 )
                 if st.button("🚀 START EQUITY AUTO TRADING", use_container_width=True, key="eq_auto_start"):
-                    st.session_state.auto_eq     = True
-                    st.session_state.auto_eq_end = (
+                    st.session_state.auto_eq       = True
+                    st.session_state.auto_eq_end   = (
                         datetime.now() + timedelta(minutes=int(a_dur))
                     ).isoformat()
-                    st.session_state["eq_at_mode2"] = a_mode
-                    st.session_state["eq_at_max"]   = int(a_max)
-                    st.session_state["eq_at_scan"]  = int(a_scan)
+                    st.session_state["eq_at_mode2"]  = a_mode
+                    st.session_state["eq_at_max"]    = int(a_max)
+                    st.session_state["eq_at_scan"]   = int(a_scan)
+                    st.session_state["eq_total_s"]   = float(a_dur) * 60.0
+                    st.session_state["eq_start_ts"]  = time.time()
                     db.save("auto_eq",     True)
                     db.save("auto_eq_end", st.session_state.auto_eq_end)
                     st.rerun()
@@ -541,7 +543,11 @@ with page_tabs[0]:
             opnl = sum(p.get("pnl", 0) for p in st.session_state.eq_portfolio)
             c3.metric("Live P&L",  f"₹{opnl:+,.0f}")
             c4.metric("Realized",  f"₹{sum(p.get('pnl',0) for p in st.session_state.eq_history):+,.0f}")
-            st.progress(min(prog_pct, 1.0))
+            _eq_total_s  = float(st.session_state.get("eq_total_s", 1800))
+            _eq_start_ts = float(st.session_state.get("eq_start_ts", time.time()))
+            elapsed_eq   = time.time() - _eq_start_ts
+            prog_pct     = max(0.0, min(1.0, elapsed_eq / max(_eq_total_s, 1)))
+            st.progress(prog_pct)
 
             if rem <= 0:
                 st.warning("⏰ Session ended — squaring off all equity positions!")
@@ -689,6 +695,7 @@ with page_tabs[0]:
                 db.save("journal",      st.session_state.journal)
                 update_kelly()
 
+                st.caption(f"🔄 Auto-refreshing | Last: {datetime.now().strftime('%H:%M:%S')}")
                 st.markdown("### Live Equity Positions")
                 if st.session_state.eq_portfolio:
                     for at_idx, pos in enumerate(st.session_state.eq_portfolio):
@@ -771,7 +778,7 @@ with page_tabs[0]:
                         update_kelly()
                         st.rerun()
 
-                time.sleep(12)
+                time.sleep(10)
                 st.rerun()
 
     # ── EQ Open Positions ─────────────────────────────────────────────────────
@@ -1326,9 +1333,11 @@ with page_tabs[1]:
                         st.session_state.auto_opt_end = (
                             datetime.now() + timedelta(minutes=int(oa_dur))
                         ).isoformat()
-                        st.session_state["oa_max2"] = int(oa_max)
-                        st.session_state["oa_idx2"] = oa_idx
-                        st.session_state["oa_str2"] = int(oa_str)
+                        st.session_state["oa_max2"]    = int(oa_max)
+                        st.session_state["oa_idx2"]    = oa_idx
+                        st.session_state["oa_str2"]    = int(oa_str)
+                        st.session_state["oa_total_s"] = float(oa_dur) * 60.0
+                        st.session_state["oa_start_ts"] = time.time()
                         db.save("auto_opt",     True)
                         db.save("auto_opt_end", st.session_state.auto_opt_end)
                         st.rerun()
@@ -1347,7 +1356,12 @@ with page_tabs[1]:
             op_pnl = sum(p.get("pnl", 0) for p in st.session_state.opt_portfolio)
             oc3.metric("Live P&L",  f"₹{op_pnl:+,.0f}")
             oc4.metric("Realized",  f"₹{sum(p.get('pnl',0) for p in st.session_state.opt_history):+,.0f}")
-            st.progress(min(prog, 1.0))
+            # Use stored duration (in seconds) so progress survives tab switches
+            _oa_total_s = float(st.session_state.get("oa_total_s", 1800))
+            _oa_start_ts = float(st.session_state.get("oa_start_ts", time.time()))
+            elapsed = time.time() - _oa_start_ts
+            prog = max(0.0, min(1.0, elapsed / max(_oa_total_s, 1)))
+            st.progress(prog)
 
             if rem <= 0:
                 for pos in st.session_state.opt_portfolio:
@@ -1423,7 +1437,10 @@ with page_tabs[1]:
                         k = f"{sig['index']}{sig['strike']}{sig['type']}"
                         if k in existing: continue
                         lot  = sig["lot"]; pr2 = sig["price"]
-                        lots2 = max(1, int(eng.kelly_size(float(trade_cap), st.session_state.kelly_wr, 1.5, sig["strength"]) / (pr2 * lot))) if use_kelly else 1
+                        # Minimum ₹1 lakh per trade: lots = ceil(100000 / (pr2 * lot))
+                        min_lots = max(1, math.ceil(100000 / max(pr2 * lot, 1)))
+                        kelly_lots = max(1, int(eng.kelly_size(float(trade_cap), st.session_state.kelly_wr, 1.5, sig["strength"]) / max(pr2 * lot, 1))) if use_kelly else 1
+                        lots2 = max(min_lots, kelly_lots)
                         cost2 = eng.options_cost(pr2, lots2, lot, "BUY")
                         trade = {
                             "id":         f"{sig['index']}{sig['strike']}{sig['type']}_{int(time.time()*1000)}",
@@ -1441,6 +1458,9 @@ with page_tabs[1]:
                         }
                         st.session_state.opt_portfolio.append(trade)
                         existing.add(k)
+                        st.success(f"✅ AUTO: Bought {lots2}L {sig['index']} {sig['strike']} {sig['type']} @ ₹{pr2:.2f} | Invested: ₹{pr2*lots2*lot:,.0f}")
+                    # Persist new entries immediately
+                    db.save("opt_portfolio", st.session_state.opt_portfolio)
 
                 still = []
                 for pos in st.session_state.opt_portfolio:
@@ -1498,6 +1518,8 @@ with page_tabs[1]:
                 db.save("journal",       st.session_state.journal)
                 update_kelly()
 
+                # Auto-refresh every 15s while trading is active
+                st.caption(f"🔄 Auto-refreshing every 15s | Last: {datetime.now().strftime('%H:%M:%S')}")
                 st.markdown("### Live Options Positions")
                 if st.session_state.opt_portfolio:
                     for at_oi, pos in enumerate(st.session_state.opt_portfolio):
@@ -1587,7 +1609,7 @@ with page_tabs[1]:
                         db.save("journal",      st.session_state.journal)
                         update_kelly()
                         st.rerun()
-                time.sleep(15)
+                time.sleep(10)
                 st.rerun()
 
     # ── Options Open Positions ────────────────────────────────────────────────
@@ -1898,13 +1920,15 @@ with page_tabs[2]:
                     unsafe_allow_html=True,
                 )
                 if st.button("🚀 START FUTURES AUTO TRADING", use_container_width=True, key="fa_start"):
-                    st.session_state.auto_fut     = True
-                    st.session_state.auto_fut_end = (
+                    st.session_state.auto_fut      = True
+                    st.session_state.auto_fut_end  = (
                         datetime.now() + timedelta(minutes=int(fa_dur))
                     ).isoformat()
-                    st.session_state["fa_max2"]  = int(fa_max)
-                    st.session_state["fa_str2"]  = int(fa_str)
-                    st.session_state["fa_scan2"] = int(fa_scan)
+                    st.session_state["fa_max2"]    = int(fa_max)
+                    st.session_state["fa_str2"]    = int(fa_str)
+                    st.session_state["fa_scan2"]   = int(fa_scan)
+                    st.session_state["fa_total_s"] = float(fa_dur) * 60.0
+                    st.session_state["fa_start_ts"] = time.time()
                     db.save("auto_fut",     True)
                     db.save("auto_fut_end", st.session_state.auto_fut_end)
                     st.rerun()
@@ -1919,7 +1943,11 @@ with page_tabs[2]:
             fp_pnl = sum(p.get("pnl", 0) for p in st.session_state.fut_portfolio)
             fc3b.metric("Live P&L",  f"₹{fp_pnl:+,.0f}")
             fc4b.metric("Realized",  f"₹{sum(p.get('pnl',0) for p in st.session_state.fut_history):+,.0f}")
-            st.progress(min(prog_f, 1.0))
+            _fa_total_s  = float(st.session_state.get("fa_total_s", 1800))
+            _fa_start_ts = float(st.session_state.get("fa_start_ts", time.time()))
+            elapsed_f    = time.time() - _fa_start_ts
+            prog_f       = max(0.0, min(1.0, elapsed_f / max(_fa_total_s, 1)))
+            st.progress(prog_f)
 
             if rem_f <= 0:
                 for pos in st.session_state.fut_portfolio:
@@ -1971,10 +1999,13 @@ with page_tabs[2]:
                         p3       = sig["price"]
                         lot_sz3  = 25 if "NIFTY" in sig["symbol"] else (15 if "BANK" in sig["symbol"] else 1)
                         margin3  = round(p3 * lot_sz3 * 0.12, 0)
-                        kc_f2    = eng.kelly_size(float(trade_cap), st.session_state.kelly_wr, sig["rr"], sig["strength"]) if use_kelly else float(trade_cap)
-                        lots_f2  = max(1, int(kc_f2 / max(margin3, 1)))
-                        cost_f2  = eng.futures_cost(p3, lots_f2, lot_sz3, "BUY")
-                        trade_f2 = {
+                        # Minimum ₹1 lakh per trade: lots = ceil(100000 / margin_per_lot)
+                        min_lots_f = max(1, math.ceil(100000 / max(margin3, 1)))
+                        kc_f2      = eng.kelly_size(float(trade_cap), st.session_state.kelly_wr, sig["rr"], sig["strength"]) if use_kelly else float(trade_cap)
+                        kelly_lots_f = max(1, int(kc_f2 / max(margin3, 1)))
+                        lots_f2    = max(min_lots_f, kelly_lots_f)
+                        cost_f2    = eng.futures_cost(p3, lots_f2, lot_sz3, "BUY")
+                        trade_f2   = {
                             "id":         f"{sig['symbol']}_FUT_{int(time.time()*1000)}",
                             "symbol":     sig["symbol"],
                             "type":       "LONG" if "BUY" in sig["rec"] else "SHORT",
@@ -1992,6 +2023,9 @@ with page_tabs[2]:
                         }
                         st.session_state.fut_portfolio.append(trade_f2)
                         fexist.add(fk)
+                        st.success(f"✅ AUTO: {trade_f2['type']} {sig['symbol'].replace('.NS','')} FUT {lots_f2}L @ ₹{p3:.2f} | Margin: ₹{margin3*lots_f2:,.0f}")
+                    # Persist new entries immediately
+                    db.save("fut_portfolio", st.session_state.fut_portfolio)
 
                 fstill = []
                 for pos in st.session_state.fut_portfolio:
@@ -2051,6 +2085,8 @@ with page_tabs[2]:
                 db.save("journal",       st.session_state.journal)
                 update_kelly()
 
+                # Auto-refresh every 12s while trading is active
+                st.caption(f"🔄 Auto-refreshing every 12s | Last: {datetime.now().strftime('%H:%M:%S')}")
                 st.markdown("### Live Futures Positions")
                 if st.session_state.fut_portfolio:
                     for at_fi, pos in enumerate(st.session_state.fut_portfolio):
@@ -2132,7 +2168,7 @@ with page_tabs[2]:
                         db.save("journal",     st.session_state.journal)
                         update_kelly()
                         st.rerun()
-                time.sleep(12)
+                time.sleep(10)
                 st.rerun()
 
     # ── Futures Open Positions ────────────────────────────────────────────────
