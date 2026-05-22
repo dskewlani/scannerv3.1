@@ -199,19 +199,22 @@ def _sf(val, default=0.0):
 # ─── Live Price — NSE India Public API ───────────────────────────────────────
 _price_cache: dict = {}
 
-def get_live_price(symbol: str) -> float | None:
+# Separate store for the last *confirmed live* price per symbol.
+# This is updated only when an API call actually succeeds so that
+# portfolio CMP display always shows a real market price rather than
+# the static entry/buying price when the API is temporarily unavailable.
+_last_confirmed_live: dict = {}   # sym_clean → {"price": float, "ts": float}
+
+
+def _fetch_live_price_from_api(symbol: str) -> float | None:
     """
-    Fetch live/last-traded price from NSE India public API.
-    Falls back to cached OHLCV close price.
-    NO login, NO API key required.
+    Try every available NSE API endpoint and return a confirmed live price.
+    Returns None only when ALL sources fail — never returns an OHLCV fallback.
+    This guarantees callers can distinguish a real market price from a stale value.
     """
     sym_clean = _nse_clean_symbol(symbol)
-    cache_key = f"live_{sym_clean}"
-    cached = _price_cache.get(cache_key)
-    if cached and (time.time() - cached["ts"]) < 12:          # 12s TTL for live
-        return cached["price"]
 
-    # 1) NSE Equity Quote
+    # 1) NSE Equity Quote  ─────────────────────────────────────────────────────
     try:
         sess = _get_nse_session()
         url  = f"https://www.nseindia.com/api/quote-equity?symbol={sym_clean}"
@@ -221,32 +224,87 @@ def get_live_price(symbol: str) -> float | None:
             ltp  = (data.get("priceInfo", {}).get("lastPrice")
                     or data.get("priceInfo", {}).get("close"))
             if ltp and float(ltp) > 0:
-                _price_cache[cache_key] = {"price": float(ltp), "ts": time.time()}
                 return float(ltp)
     except Exception:
         pass
 
-    # 2) NSE Index Quote (for ^NSEI, ^NSEBANK, etc.)
+    # 2) NSE Index Quote (for ^NSEI, ^NSEBANK, etc.)  ─────────────────────────
     if symbol.startswith("^"):
         try:
             idx_name = _INDEX_NSE_NAME.get(symbol, "")
             if idx_name:
                 sess = _get_nse_session()
-                url  = f"https://www.nseindia.com/api/allIndices"
-                resp = sess.get(url, timeout=8)
+                resp = sess.get("https://www.nseindia.com/api/allIndices", timeout=8)
                 if resp.status_code == 200:
                     for item in resp.json().get("data", []):
                         if item.get("indexSymbol", "").upper() == idx_name.upper() \
                            or item.get("index", "").upper() == idx_name.upper():
                             ltp = item.get("last") or item.get("previousClose")
                             if ltp and float(ltp) > 0:
-                                _price_cache[cache_key] = {"price": float(ltp), "ts": time.time()}
                                 return float(ltp)
         except Exception:
             pass
 
-    # 3) Fallback: last known close from OHLCV cache
-    ohlcv_key = f"{symbol}_3mo_1d"
+    # 3) NSE Chart data — intraday tick (equity, non-index)  ──────────────────
+    if not symbol.startswith("^"):
+        try:
+            sess = _get_nse_session()
+            url  = (
+                f"https://www.nseindia.com/api/chart-databyindex"
+                f"?index={sym_clean}EQN&indices=true"
+            )
+            resp = sess.get(url, timeout=8)
+            if resp.status_code == 200:
+                gd = resp.json().get("grapthData", [])
+                if gd:
+                    last_tick = gd[-1]
+                    if isinstance(last_tick, (list, tuple)) and len(last_tick) >= 2:
+                        ltp = float(last_tick[1])
+                        if ltp > 0:
+                            return ltp
+        except Exception:
+            pass
+
+    return None   # All sources failed
+
+
+def get_live_price(symbol: str) -> float | None:
+    """
+    Fetch live/last-traded price from NSE India public API.
+
+    Priority:
+      1. In-memory 12-second live cache (fastest path).
+      2. API fetch via _fetch_live_price_from_api (three endpoints tried).
+      3. Last *confirmed-live* price from _last_confirmed_live (stale but real).
+      4. Last known OHLCV close (last resort — historical, not intraday).
+
+    The key fix: _last_confirmed_live is updated every time the API succeeds
+    so that even if the API is briefly unavailable, portfolio CMP will show
+    the most-recent REAL market price instead of reverting to the entry price.
+    """
+    sym_clean = _nse_clean_symbol(symbol)
+    cache_key = f"live_{sym_clean}"
+
+    # 1) Short-lived in-memory cache (12 s) ───────────────────────────────────
+    cached = _price_cache.get(cache_key)
+    if cached and (time.time() - cached["ts"]) < 12:
+        return cached["price"]
+
+    # 2) Try live API ─────────────────────────────────────────────────────────
+    ltp = _fetch_live_price_from_api(symbol)
+    if ltp and ltp > 0:
+        _price_cache[cache_key]          = {"price": ltp, "ts": time.time()}
+        _last_confirmed_live[sym_clean]  = {"price": ltp, "ts": time.time()}
+        return ltp
+
+    # 3) Fall back to the last price the API DID confirm (could be a few minutes old
+    #    but is a real market price — NOT the entry price) ─────────────────────
+    confirmed = _last_confirmed_live.get(sym_clean)
+    if confirmed:
+        return confirmed["price"]
+
+    # 4) Last resort: OHLCV close (historical — could be previous session) ────
+    ohlcv_key    = f"{symbol}_3mo_1d"
     ohlcv_cached = _price_cache.get(ohlcv_key)
     if ohlcv_cached and ohlcv_cached.get("df") is not None:
         df = ohlcv_cached["df"]
@@ -260,6 +318,10 @@ def get_live_price(symbol: str) -> float | None:
 
 # ─── Live Option Price (BS-based, uses live spot) ─────────────────────────────
 _opt_price_cache: dict = {}
+# Stores the last successfully computed BS price per option key so that
+# even when the API is down we still show a real market-based price,
+# not the static entry/buying price.
+_opt_last_confirmed: dict = {}   # cache_key → {"price": float, "ts": float}
 
 def get_live_option_price(index: str, strike: int, opt_type: str,
                           expiry_str: str, vix: float) -> float | None:
@@ -276,39 +338,56 @@ def get_live_option_price(index: str, strike: int, opt_type: str,
     vix        : current India VIX value
 
     Cache TTL: 12 seconds (matches equity get_live_price TTL).
-    Falls back to stored CMP on any error — never crashes.
+
+    Fallback chain:
+      1. 12-second in-memory cache (fastest).
+      2. Fresh BS price computed from live spot.
+      3. Last *successfully computed* BS price (_opt_last_confirmed).
+         This guarantees that CMP never reverts to the static entry price
+         when the underlying spot fetch temporarily fails.
     """
     cache_key = f"opt_{index}_{strike}_{opt_type}_{expiry_str}"
+
+    # 1) Short-lived cache ─────────────────────────────────────────────────────
     cached = _opt_price_cache.get(cache_key)
     if cached and (time.time() - cached["ts"]) < 12:
         return cached["price"]
 
     try:
-        # 1. Fetch live spot for the underlying index
+        # 2a. Fetch live spot for the underlying index
         idx_sym = "^NSEBANK" if index == "BANKNIFTY" else "^NSEI"
         spot = get_live_price(idx_sym)
         if not spot or spot <= 0:
-            # Fallback: re-use the last allIndices call
+            # Secondary fallback: allIndices
             indices = get_all_indices()
             spot = indices.get("BN" if index == "BANKNIFTY" else "NF", {}).get("p", 0)
         if not spot or spot <= 0:
-            return None
+            # Spot unavailable — return last confirmed so CMP doesn't freeze at entry
+            confirmed = _opt_last_confirmed.get(cache_key)
+            return confirmed["price"] if confirmed else None
 
-        # 2. Time to expiry
+        # 2b. Time to expiry
         ex_date = date.fromisoformat(expiry_str)
         dte = max(1, (ex_date - date.today()).days)
         T   = dte / 365.0
         r   = 0.065
         iv  = max(0.08, vix / 100.0 * (1 + 0.05 * math.sqrt(T)))
 
-        # 3. Black-Scholes price — same formula used in build_chain
+        # 2c. Black-Scholes price
         g = bs_greeks(spot, float(strike), T, r, iv, opt_type)
         price = g.get("price", 0.0)
         if price and price > 0:
-            _opt_price_cache[cache_key] = {"price": price, "ts": time.time()}
+            _opt_price_cache[cache_key]    = {"price": price, "ts": time.time()}
+            _opt_last_confirmed[cache_key] = {"price": price, "ts": time.time()}
             return price
     except Exception:
         pass
+
+    # 3) All live attempts failed — return last confirmed live BS price ─────────
+    confirmed = _opt_last_confirmed.get(cache_key)
+    if confirmed:
+        return confirmed["price"]
+
     return None
 
 # ─── NSE Historical OHLCV (no login) ─────────────────────────────────────────
