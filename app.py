@@ -2890,7 +2890,14 @@ with page_tabs[7]:
         c1, c2, c3, c4 = st.columns([2,1,1,1])
         c1.write(f"{sym.replace('.NS','')} CMP ₹{lp:,.2f}")
         side = c2.selectbox("Side", ["BUY", "SELL"], key=f"etf_side_{sym}")
-        qty = c3.number_input("Qty", 1, 1000000, amount_to_qty(trade_cap, lp), 1, key=f"etf_qty_{sym}")
+       calc_qty = max(1, min(amount_to_qty(trade_amt, lp), 1000000))
+
+        qty = c3.number_input(
+            "Qty",
+            min_value=1,
+            max_value=1000000,
+            value=calc_qty
+        )
         if c4.button("Trade", key=f"etf_trade_{sym}") and lp > 0:
             cost = eng.equity_cost(lp, int(qty), side, True)
             st.session_state.etf_portfolio.append({"id": f"ETF_{sym}_{int(time.time()*1000)}", "symbol": sym, "type": side, "entry": lp, "cmp": lp, "qty": int(qty), "invested": round(lp*int(qty),2), "brokerage": cost, "pnl": 0.0, "entry_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "entry_dt": datetime.now().isoformat()})
