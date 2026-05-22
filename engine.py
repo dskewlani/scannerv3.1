@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 import math
 import time
+import os
 import requests
 import concurrent.futures
 import warnings
@@ -144,6 +145,11 @@ FUTURES_SYMBOLS = [
     "JSWSTEEL.NS","HINDALCO.NS","ONGC.NS","NTPC.NS","POWERGRID.NS",
 ]
 
+ETF_SYMBOLS = ["NIFTYBEES.NS", "BANKBEES.NS", "JUNIORBEES.NS", "GOLDBEES.NS", "SILVERBEES.NS", "ITBEES.NS", "PHARMABEES.NS", "PSUBNKBEES.NS", "LIQUIDBEES.NS", "MON100.NS", "MID150BEES.NS", "CPSEETF.NS"]
+MCX_SYMBOLS = ["GOLDM", "GOLD", "SILVERM", "SILVER", "CRUDEOIL", "NATURALGAS", "COPPER", "ZINC", "ALUMINIUM", "LEAD", "NICKEL"]
+MCX_LOT_SIZES = {"GOLDM": 100, "GOLD": 1000, "SILVERM": 5, "SILVER": 30, "CRUDEOIL": 100, "NATURALGAS": 1250, "COPPER": 2500, "ZINC": 5000, "ALUMINIUM": 5000, "LEAD": 5000, "NICKEL": 1500}
+MCX_BASE_PRICES = {"GOLDM": 72000, "GOLD": 72000, "SILVERM": 92000, "SILVER": 92000, "CRUDEOIL": 6800, "NATURALGAS": 260, "COPPER": 860, "ZINC": 260, "ALUMINIUM": 235, "LEAD": 190, "NICKEL": 1600}
+
 # ─── Sector Mapping ──────────────────────────────────────────────────────────
 SECTOR_MAP = {
     "HDFCBANK.NS":"Banking","ICICIBANK.NS":"Banking","SBIN.NS":"Banking",
@@ -196,6 +202,55 @@ def _sf(val, default=0.0):
         return default
 
 
+# Angel One SmartAPI live LTP. Public scrip master is free; LTP needs your active SmartAPI JWT.
+_angel_scrip_master_cache = {"data": None, "ts": 0.0}
+
+def _angel_credentials_available():
+    return bool(os.getenv("ANGEL_API_KEY") and os.getenv("ANGEL_JWT_TOKEN"))
+
+def _angel_exchange_for_symbol(symbol):
+    s = symbol.upper().replace(".NS", "").replace(".BO", "").strip()
+    if s in MCX_SYMBOLS: return "MCX"
+    return "BSE" if symbol.upper().endswith(".BO") else "NSE"
+
+def _angel_scrip_master():
+    cached = _angel_scrip_master_cache.get("data")
+    if cached is not None and time.time() - _angel_scrip_master_cache.get("ts", 0) < 86400: return cached
+    try:
+        data = requests.get("https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json", timeout=15).json()
+        if isinstance(data, list):
+            _angel_scrip_master_cache.update({"data": data, "ts": time.time()}); return data
+    except Exception: pass
+    return cached or []
+
+def _angel_find_instrument(symbol, exchange=None):
+    exchange = exchange or _angel_exchange_for_symbol(symbol)
+    s = symbol.upper().replace(".NS", "").replace(".BO", "").replace("-EQ", "").strip()
+    best = None
+    for item in _angel_scrip_master():
+        try:
+            if item.get("exch_seg") != exchange: continue
+            name = str(item.get("name", "")).upper(); tsym = str(item.get("symbol", "")).upper()
+            if exchange in ("NSE", "BSE") and (tsym == f"{s}-EQ" or name == s or tsym.startswith(f"{s}-")):
+                best = item
+                if tsym == f"{s}-EQ": return item
+            if exchange == "MCX" and (name == s or tsym.startswith(s)): best = item
+        except Exception: continue
+    return best
+
+def _fetch_angel_ltp(symbol):
+    if not _angel_credentials_available(): return None
+    try:
+        exch = _angel_exchange_for_symbol(symbol); inst = _angel_find_instrument(symbol, exch)
+        if not inst: return None
+        payload = {"exchange": exch, "tradingsymbol": inst.get("symbol"), "symboltoken": str(inst.get("token"))}
+        headers = {"Authorization": f"Bearer {os.getenv('ANGEL_JWT_TOKEN')}", "Content-Type": "application/json", "Accept": "application/json", "X-UserType": "USER", "X-SourceID": "WEB", "X-ClientLocalIP": os.getenv("ANGEL_CLIENT_LOCAL_IP", "127.0.0.1"), "X-ClientPublicIP": os.getenv("ANGEL_CLIENT_PUBLIC_IP", "127.0.0.1"), "X-MACAddress": os.getenv("ANGEL_MAC_ADDRESS", "00:00:00:00:00:00"), "X-PrivateKey": os.getenv("ANGEL_API_KEY", "")}
+        r = requests.post("https://apiconnect.angelone.in/rest/secure/angelbroking/order/v1/getLtpData", json=payload, headers=headers, timeout=8)
+        if r.status_code == 200:
+            ltp = r.json().get("data", {}).get("ltp")
+            if ltp and float(ltp) > 0: return float(ltp)
+    except Exception: pass
+    return None
 # ─── Live Price — NSE India Public API ───────────────────────────────────────
 _price_cache: dict = {}
 
@@ -213,6 +268,12 @@ def _fetch_live_price_from_api(symbol: str) -> float | None:
     This guarantees callers can distinguish a real market price from a stale value.
     """
     sym_clean = _nse_clean_symbol(symbol)
+
+    angel_ltp = _fetch_angel_ltp(symbol)
+    if angel_ltp and angel_ltp > 0:
+        return angel_ltp
+    if _angel_exchange_for_symbol(symbol) == 'MCX':
+        return None
 
     # 1) NSE Equity Quote  ─────────────────────────────────────────────────────
     try:
@@ -273,7 +334,7 @@ def get_live_price(symbol: str) -> float | None:
     Fetch live/last-traded price from NSE India public API.
 
     Priority:
-      1. In-memory 12-second live cache (fastest path).
+      1. In-memory 4-second live cache (fastest path).
       2. API fetch via _fetch_live_price_from_api (three endpoints tried).
       3. Last *confirmed-live* price from _last_confirmed_live (stale but real).
       4. Last known OHLCV close (last resort — historical, not intraday).
@@ -287,7 +348,7 @@ def get_live_price(symbol: str) -> float | None:
 
     # 1) Short-lived in-memory cache (12 s) ───────────────────────────────────
     cached = _price_cache.get(cache_key)
-    if cached and (time.time() - cached["ts"]) < 12:
+    if cached and (time.time() - cached["ts"]) < 4:
         return cached["price"]
 
     # 2) Try live API ─────────────────────────────────────────────────────────
@@ -325,7 +386,7 @@ _opt_last_confirmed: dict = {}   # cache_key → {"price": float, "ts": float}
 
 # Separate short-TTL spot cache used ONLY by option pricing.
 # Kept separate from _price_cache so equity auto-trading and option
-# pricing don't share the same 12-second window — option CMP must
+# pricing don't share the same 4-second window — option CMP must
 # recompute every cycle with the latest spot even if the equity cache
 # hasn't expired yet.
 _index_spot_cache: dict = {}   # "BN" | "NF" → {"price": float, "ts": float}
@@ -333,20 +394,20 @@ _index_spot_cache: dict = {}   # "BN" | "NF" → {"price": float, "ts": float}
 
 def _get_fresh_index_spot(index: str) -> float | None:
     """
-    Fetch the live spot for BANKNIFTY or NIFTY50 with a very short 8-second
+    Fetch the live spot for BANKNIFTY or NIFTY50 with a very short 4-second
     cache dedicated to option pricing.  This is intentionally NOT shared with
-    the main _price_cache used by get_live_price() so that the two 12-second
+    the main _price_cache used by get_live_price() so that the two 4-second
     windows don't accidentally synchronise and make the spot look unchanged.
 
     Priority:
-      1. 8s dedicated spot cache.
+      1. 4s dedicated spot cache.
       2. Direct NSE allIndices API call (fresh HTTP request).
       3. NSE equity-quote API for the index symbol.
       4. Last value stored in _last_confirmed_live (set by get_live_price).
     """
     key = "BN" if index == "BANKNIFTY" else "NF"
     cached = _index_spot_cache.get(key)
-    if cached and (time.time() - cached["ts"]) < 8:
+    if cached and (time.time() - cached["ts"]) < 4:
         return cached["price"]
 
     # 1) Direct allIndices call — this is the fastest and most reliable
@@ -391,7 +452,7 @@ def _get_fresh_index_spot(index: str) -> float | None:
 def force_refresh_index_spots():
     """
     Called by app.py at the start of every auto-trading cycle to evict the
-    8-second index spot cache so the VERY NEXT call to _get_fresh_index_spot()
+    4-second index spot cache so the VERY NEXT call to _get_fresh_index_spot()
     always triggers a real HTTP request.  This guarantees CMP changes every
     refresh cycle even when the option price cache TTL and the spot cache TTL
     would otherwise align and produce an identical recomputed price.
@@ -399,6 +460,16 @@ def force_refresh_index_spots():
     _index_spot_cache.clear()
 
 
+
+def force_refresh_live_prices(symbols=None):
+    if symbols is None:
+        keys = [k for k in _price_cache if str(k).startswith("live_")]
+    else:
+        keys = [f"live_{_nse_clean_symbol(s)}" for s in symbols]
+    for key in keys:
+        _price_cache.pop(key, None)
+    force_refresh_index_spots()
+    _opt_price_cache.clear()
 def get_live_option_price(index: str, strike: int, opt_type: str,
                           expiry_str: str, vix: float) -> float | None:
     """
@@ -414,23 +485,23 @@ def get_live_option_price(index: str, strike: int, opt_type: str,
     vix        : current India VIX value
 
     Fallback chain:
-      1. 10-second in-memory option price cache.
+      1. 4-second in-memory option price cache.
       2. Fresh BS price recomputed from a newly fetched spot
-         (_get_fresh_index_spot bypasses the shared 12s equity cache).
+         (_get_fresh_index_spot bypasses the shared 4s equity cache).
       3. Last *successfully computed* BS price (_opt_last_confirmed).
          Ensures CMP never reverts to the static entry price.
     """
     cache_key = f"opt_{index}_{strike}_{opt_type}_{expiry_str}"
 
-    # 1) Short-lived option price cache (10s — slightly less than equity's 12s
+    # 1) Short-lived option price cache (4s — slightly less than equity's 4s
     #    to ensure the spot fetch always leads the option cache expiry) ─────────
     cached = _opt_price_cache.get(cache_key)
-    if cached and (time.time() - cached["ts"]) < 10:
+    if cached and (time.time() - cached["ts"]) < 4:
         return cached["price"]
 
     try:
-        # 2a. Fetch live spot via dedicated index-spot fetcher (8s cache, own
-        #     HTTP request, NOT shared with the 12s equity price cache)
+        # 2a. Fetch live spot via dedicated index-spot fetcher (4s cache, own
+        #     HTTP request, NOT shared with the 4s equity price cache)
         spot = _get_fresh_index_spot(index)
         if not spot or spot <= 0:
             confirmed = _opt_last_confirmed.get(cache_key)
@@ -1756,3 +1827,4 @@ def scan_parallel(symbols, mode="INTRADAY", market_mood="NEUTRAL", vix=15.0,
         results.sort(key=lambda x: (0 if "BUY" in x["rec"] else 1, -x["strength"]))
 
     return results
+
