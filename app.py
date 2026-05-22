@@ -1468,10 +1468,21 @@ with page_tabs[1]:
                     # Persist new entries immediately
                     db.save("opt_portfolio", st.session_state.opt_portfolio)
 
+                # ── Force-evict spot & option caches before CMP refresh ──────
+                # This ensures _get_fresh_index_spot() fires a real HTTP call
+                # every cycle instead of returning the same cached spot that
+                # was used when the position was opened (which would produce
+                # an identical BS price and make CMP look frozen at entry).
+                eng.force_refresh_index_spots()
+
                 still = []
                 for pos in st.session_state.opt_portfolio:
                     ep2  = pos["entry"]; lots = pos["lots"]; ls = pos["lot_size"]
-                    # ── LIVE CMP: fetch fresh BS price using current spot ────
+                    # ── LIVE CMP: evict per-position option cache then refetch ─
+                    eng._opt_price_cache.pop(
+                        f"opt_{pos['index']}_{pos['strike']}_{pos['type']}_{pos.get('expiry', str(exp_bn))}",
+                        None
+                    )
                     live_p = get_live_option_cmp(
                         pos["index"], pos["strike"], pos["type"],
                         pos.get("expiry", str(exp_bn)), vix_val
@@ -1632,10 +1643,17 @@ with page_tabs[1]:
             pc2[2].markdown(metric_card(f"{tot_pnl2/tot_inv2*100:+.1f}%" if tot_inv2 > 0 else "0%", "Return%", "var(--teal)"), unsafe_allow_html=True)
             st.markdown("<br>", unsafe_allow_html=True)
 
+            # ── Force fresh spot fetch for positions display ─────────────────
+            eng.force_refresh_index_spots()
+
             for pos in st.session_state.opt_portfolio:
                 oc3   = "var(--accent)" if pos["type"] == "CE" else "var(--red)"
                 ep2   = pos["entry"]; lots = pos["lots"]; ls = pos["lot_size"]
-                # ── LIVE CMP: refresh for open-positions display ─────────────
+                # ── LIVE CMP: evict stale option cache then refresh ───────────
+                eng._opt_price_cache.pop(
+                    f"opt_{pos['index']}_{pos['strike']}_{pos['type']}_{pos.get('expiry', str(exp_bn))}",
+                    None
+                )
                 live_p2 = get_live_option_cmp(
                     pos["index"], pos["strike"], pos["type"],
                     pos.get("expiry", str(exp_bn)), vix_val
